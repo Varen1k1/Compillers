@@ -1,1156 +1,812 @@
-%glr-parser
+/*
+ * Kotlin validator grammar (Bison, LALR(1)).
+ *
+ * Strategy: parse declarations strictly (package/import/class/object/
+ * interface/fun/val/var/typealias), parse statement and expression bodies
+ * permissively. Soft keywords (open, final, private, get, set, init, by,
+ * ...) all arrive as a single SOFT_KW token, so the grammar doesn't have
+ * to enumerate every keyword in every modifier slot.
+ *
+ * The parser reports lexical errors (from the lexer) and syntax errors
+ * (from yyerror), recovers via the standard 'error' token, and continues
+ * - per the project spec it must NOT abort on the first error.
+ */
 %{
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
 
-extern int yylex();
-extern int yylineno;
+extern int yylex(void);
+extern int line_num;
 extern FILE *yyin;
+extern char *yytext;
+
 void yyerror(const char *s);
 
 int error_count = 0;
-int has_package = 0;
 
 typedef struct {
-    char* name;
-    int line;
-} Declaration;
+    char *kind;
+    char *name;
+    int   line;
+} Decl;
 
-Declaration declarations[1000];
-int decl_count = 0;
+static Decl decls[4000];
+static int  decl_count = 0;
 
-void add_declaration(const char* name, int line) {
-    if (decl_count < 1000) {
-        declarations[decl_count].name = strdup(name);
-        declarations[decl_count].line = line;
-        decl_count++;
-    }
+static void add_decl(const char *kind, const char *name, int line) {
+    if (decl_count >= 4000) return;
+    decls[decl_count].kind = strdup(kind ? kind : "?");
+    decls[decl_count].name = strdup(name ? name : "<anon>");
+    decls[decl_count].line = line;
+    decl_count++;
 }
 
+/* Source line cache, populated once in main() so yyerror() can echo the
+ * offending line back to the user. Keeps errors anchored to real code.
+ */
+static char **source_lines  = NULL;
+static int    source_nlines = 0;
+
+/* Load the file twice: once for the cache, once via yyin for the lexer.
+ * Returns 1 on success, 0 if the file is unreadable.
+ */
+static int load_source_lines(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    int   cap   = 256;
+    int   count = 0;
+    char **arr  = malloc(cap * sizeof(char *));
+    char   buf[8192];
+
+    while (fgets(buf, sizeof(buf), f)) {
+        /* strip trailing newline */
+        size_t n = strlen(buf);
+        while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
+        if (count >= cap) {
+            cap *= 2;
+            arr  = realloc(arr, cap * sizeof(char *));
+        }
+        arr[count++] = strdup(buf);
+    }
+    fclose(f);
+
+    source_lines  = arr;
+    source_nlines = count;
+    return 1;
+}
+
+/* Print the cached line for the current error. Used by both yyerror() and
+ * the lexer's catch-all rule, hence non-static.
+ */
+void print_source_line(int line) {
+    if (line < 1 || line > source_nlines) return;
+    fprintf(stderr, "    | %s\n", source_lines[line - 1]);
+}
 %}
 
 %union {
-    int int_val;
-    char* str_val;
-    struct {
-        char* name;
-        int line;
-    } decl_val;
+    char *str;
 }
 
-/* Tokens - Literals and Identifiers */
-%token <int_val> INTEGER_LITERAL
-%token <str_val> IDENTIFIER REAL_LITERAL HEX_LITERAL BIN_LITERAL LONG_LITERAL UNSIGNED_LITERAL
-%token <str_val> CHARACTER_LITERAL STRING_LITERAL
+%token <str> IDENTIFIER SOFT_KW STRING_LIT INT_LIT REAL_LIT CHAR_LIT BOOL_LIT
+%token NL NULL_LIT
+%token PACKAGE IMPORT CLASS INTERFACE OBJECT FUN VAL VAR
+%token IF ELSE WHEN FOR WHILE DO RETURN BREAK CONTINUE THROW TRY CATCH FINALLY
+%token THIS SUPER IN NOT_IN IS NOT_IS AS AS_SAFE TYPEALIAS ENUM
+%token INIT CONSTRUCTOR BY GET SET
+%token EQEQEQ NEQEQ EQEQ NEQ LEQ GEQ ANDAND OROR INCR DECR
+%token PLUS_EQ MINUS_EQ STAR_EQ SLASH_EQ MOD_EQ
+%token RANGE RANGE_UNTIL ARROW SAFE_DOT ELVIS COLONCOLON DBL_EXCL
 
-/* Tokens - Modifiers */
-%token <str_val> ABSTRACT ANNOTATION BY CATCH COMPANION CONSTRUCTOR CROSSINLINE DATA
-%token <str_val> DELEGATE DYNAMIC ENUM EXPECT_LITERAL EXTERNAL FIELD FILE_KW FINAL
-%token <str_val> FINALLY GET IMPORT INFIX INIT INLINE INNER INTERNAL LATEINIT
-%token <str_val> NOINLINE OPEN OPERATOR OUT OVERRIDE PARAM PRIVATE PROPERTY
-%token <str_val> PROTECTED PUBLIC RECEIVER REIFIED SEALED SET SETPARAM SUSPEND
-%token <str_val> TAILREC VARARG WHERE ACTUAL VALUE CONST_LITERAL
+%type <str> identifier qualifiedName
 
-/* Tokens - Keywords */
-%token AS AS_SAFE BREAK CLASS CONTINUE DO ELSE FALSE FOR FUN IF IN NOT_IN
-%token INTERFACE IS NOT_IS OBJECT PACKAGE RETURN SUPER THIS THROW TRUE TRY
-%token TYPE_ALIAS VAL VAR WHEN WHILE NULL_LITERAL
-
-/* Tokens - Operators */
-%token EQEQEQ EXCL_EQEQ EQEQ EXCL_EQ LE GE ANDAND OROR
-%token INCR DECR ADD_ASSIGN SUB_ASSIGN MULT_ASSIGN DIV_ASSIGN MOD_ASSIGN
-%token RANGE RANGE_UNTIL DOUBLE_EXCL SAFE_DOT ELVIS DOUBLE_COLON ARROW
-%token ADD SUB MULT DIV MOD ASSIGNMENT NOT LANGLE RANGLE AMPER
-
-/* Tokens - Delimiters */
-%token LPAREN RPAREN LBRACK RBRACK LCURL RCURL DOT COMMA COLON SEMICOLON QUEST AT
-%token NL DOLLAR QUOTE DOLLAR_LBRACE
-
-%type <str_val> identifier simpleIdentifier type modifiers
-%type <str_val> typeArguments typeParameters
-
-%expect 128
-
-%start kotlinFile
-
-/* Operator precedence and associativity (lowest to highest) */
-%nonassoc LOWEST
-%nonassoc IF
-%nonassoc ELSE
-%right ASSIGNMENT ADD_ASSIGN SUB_ASSIGN MULT_ASSIGN DIV_ASSIGN MOD_ASSIGN
+  /* operator precedence, lowest first - matches Kotlin's grammar reference */
+%right '=' PLUS_EQ MINUS_EQ STAR_EQ SLASH_EQ MOD_EQ
 %right ARROW
-%left OROR
-%left ANDAND
-%left EQEQ EXCL_EQ EQEQEQ EXCL_EQEQ
+%left  OROR
+%left  ANDAND
+%left  EQEQ NEQ EQEQEQ NEQEQ
+%left  '<' '>' LEQ GEQ
 %nonassoc IN NOT_IN IS NOT_IS
-%nonassoc RANGE RANGE_UNTIL
-%left LANGLE RANGLE LE GE
 %right ELVIS
-%left ADD SUB
-%left MULT DIV MOD
-%left AS AS_SAFE
-%right NOT INCR DECR DOUBLE_EXCL
-%left DOT SAFE_DOT DOUBLE_COLON
-%nonassoc LPAREN RPAREN LBRACK RBRACK
-%nonassoc CALL_SUFFIX
-%nonassoc HIGHEST
+%left  INFIX_FN                              /* infix function call: a foo b */
+%nonassoc RANGE RANGE_UNTIL
+%left  '+' '-'
+%left  '*' '/' '%'
+%nonassoc AS AS_SAFE
+%right '!' UMINUS UPLUS
+%right INCR DECR
+%left  '.' SAFE_DOT
+%left  COLONCOLON
+%nonassoc DBL_EXCL
+%left  '(' '['
+%nonassoc THEN
+%nonassoc ELSE
+
+%start file
 
 %%
 
-/* ============================================================================ */
-/* ROOT RULES */
-/* ============================================================================ */
+/* ============================================================== */
+/* File top level                                                  */
+/* ============================================================== */
 
-kotlinFile
-    : opt_nl topLevelItems opt_nl
-    | opt_nl
+file
+    : opt_seps
+    | opt_seps topItems opt_seps
     ;
 
-topLevelItems
-    : topLevelItem
-    | topLevelItems separator topLevelItem
+opt_seps : /* empty */ | seps ;
+
+seps
+    : sep
+    | seps sep
+    ;
+sep : NL | ';' ;
+
+topItems
+    : topItem
+    | topItems seps topItem
+    | topItems error sep
+        { yyerrok;   /* error already counted by yyerror; this is just recovery */
+          fprintf(stderr, "         (recovered at top level around line %d)\n", line_num); }
     ;
 
-topLevelItem
-    : packageHeader
-    | importHeader
-    | topLevelDeclaration
-    | error { yyerrok; fprintf(stderr, "Skipping error at line %d\n", yylineno); }
+topItem
+    : packageDecl
+    | importDecl
+    | declaration
     ;
 
-/* ============================================================================ */
-/* SEPARATORS */
-/* ============================================================================ */
+/* ============================================================== */
+/* Package / import                                                */
+/* ============================================================== */
 
-opt_nl
-    : nl
-    | /* empty */
+packageDecl
+    : PACKAGE qualifiedName
+        { printf("[Line %d] Package: %s\n", line_num, $2); free($2); }
     ;
 
-nl
-    : NL
-    | nl NL
+importDecl
+    : IMPORT qualifiedName
+        { printf("[Line %d] Import:  %s\n", line_num, $2); free($2); }
+    | IMPORT qualifiedName '.' '*'
+        { printf("[Line %d] Import:  %s.*\n", line_num, $2); free($2); }
+    | IMPORT qualifiedName AS identifier
+        { printf("[Line %d] Import:  %s as %s\n", line_num, $2, $4); free($2); free($4); }
     ;
 
-separator
-    : SEMICOLON
-    | NL
+qualifiedName
+    : identifier                       { $$ = $1; }
+    | qualifiedName '.' identifier
+        { char *r = malloc(strlen($1)+strlen($3)+2);
+          sprintf(r, "%s.%s", $1, $3);
+          free($1); free($3); $$ = r; }
     ;
 
-separators
-    : separator
-    | separators separator
+  /*
+   * 'identifier' covers any context where the token can be used as a name.
+   * Includes IDENTIFIER, SOFT_KW, and the hard keywords that doubled as
+   * soft keywords in earlier versions (init/constructor/by) so users can
+   * still write `val constructor = ...` or `val init = ...`.
+   */
+identifier
+    : IDENTIFIER     { $$ = $1; }
+    | SOFT_KW        { $$ = $1; }
+    | CONSTRUCTOR    { $$ = strdup("constructor"); }
+    | INIT           { $$ = strdup("init"); }
+    | BY             { $$ = strdup("by"); }
+    | GET            { $$ = strdup("get"); }
+    | SET            { $$ = strdup("set"); }
     ;
 
-opt_separator
-    : separator
-    | /* empty */
+/* ============================================================== */
+/* Declarations                                                    */
+/* ============================================================== */
+
+declaration
+    : classDecl
+    | objectDecl
+    | funDecl
+    | propDecl
+    | typeAliasDecl
     ;
 
-/* ============================================================================ */
-/* PACKAGE AND IMPORTS */
-/* ============================================================================ */
-
-packageHeader
-    : PACKAGE identifier opt_separator
-        { printf("[Line %d] Package: %s\n", yylineno, $2); has_package = 1; free($2); }
+modifiers
+    : /* empty */
+    | modifiers modifierItem
     ;
 
-importHeader
-    : IMPORT identifier opt_separator
-        { printf("[Line %d] Import: %s\n", yylineno, $2); free($2); }
-    | IMPORT identifier DOT MULT opt_separator
-        { printf("[Line %d] Import all: %s.*\n", yylineno, $2); free($2); }
-    | IMPORT identifier AS simpleIdentifier opt_separator
-        { printf("[Line %d] Import as: %s as %s\n", yylineno, $2, $4); free($2); free($4); }
+modifierItem
+    : SOFT_KW
+    | ENUM
+    | annotation
     ;
 
-/* ============================================================================ */
-/* TOP-LEVEL DECLARATIONS */
-/* ============================================================================ */
-
-topLevelDeclaration
-    : classDeclaration
-    | objectDeclaration
-    | interfaceDeclaration
-    | functionDeclaration
-    | propertyDeclaration
-    | typeAliasDeclaration
-    | enumDeclaration
+annotation
+    : '@' identifier
+    | '@' identifier '(' opt_args ')'
+    | '@' SOFT_KW ':' identifier
+    | '@' SOFT_KW ':' identifier '(' opt_args ')'
     ;
 
-/* ============================================================================ */
-/* CLASS DECLARATION */
-/* ============================================================================ */
-
-classDeclaration
-    : opt_modifiers CLASS simpleIdentifier opt_typeParameters opt_primaryConstructor
-      opt_inheritance opt_classBody
-        { printf("[Line %d] Class: %s\n", yylineno, $3); add_declaration($3, yylineno); free($3); }
+classDecl
+    : modifiers CLASS IDENTIFIER opt_typeParams opt_primCtor opt_supertypes opt_whereClause opt_classBody
+        { printf("[Line %d] Class:     %s\n", line_num, $3); add_decl("class", $3, line_num); free($3); }
+    | modifiers INTERFACE IDENTIFIER opt_typeParams opt_supertypes opt_whereClause opt_classBody
+        { printf("[Line %d] Interface: %s\n", line_num, $3); add_decl("interface", $3, line_num); free($3); }
     ;
 
-opt_primaryConstructor
-    : opt_modifiers CONSTRUCTOR LPAREN opt_classParameters RPAREN
-    | LPAREN opt_classParameters RPAREN
-    | /* empty */
+objectDecl
+    : modifiers OBJECT IDENTIFIER opt_supertypes opt_classBody
+        { printf("[Line %d] Object:    %s\n", line_num, $3); add_decl("object", $3, line_num); free($3); }
+    | modifiers OBJECT opt_supertypes opt_classBody     /* unnamed (e.g. companion object) */
+        { printf("[Line %d] Object:    <anonymous>\n", line_num); add_decl("object", "<anon>", line_num); }
     ;
 
-opt_classParameters
-    : classParameterList
-    | /* empty */
+opt_typeParams
+    : /* empty */
+    | '<' typeParamList '>'
     ;
 
-classParameterList
-    : classParameter
-    | classParameterList COMMA classParameter
-    | classParameterList NL classParameter
+typeParamList
+    : typeParam
+    | typeParamList ',' typeParam
     ;
 
-classParameter
-    : opt_modifiers opt_val_var simpleIdentifier COLON type opt_equalExpression
-        { free($3); }
-    | opt_modifiers opt_val_var simpleIdentifier opt_equalExpression
-        { free($3); }
+typeParam
+    : modifiers identifier            { free($2); }
+    | modifiers identifier ':' type   { free($2); }
     ;
 
-opt_val_var
-    : VAL
-    | VAR
-    | /* empty */
+opt_primCtor
+    : /* empty */
+    | '(' ')'
+    | '(' ctorParamList opt_comma ')'
+    | modifiers CONSTRUCTOR '(' ')'
+    | modifiers CONSTRUCTOR '(' ctorParamList opt_comma ')'
     ;
 
-opt_inheritance
-    : COLON delegationSpecifiers
-    | /* empty */
+opt_comma : /* empty */ | ',' ;
+
+ctorParamList
+    : ctorParam
+    | ctorParamList ',' ctorParam
     ;
 
-delegationSpecifiers
-    : delegationSpecifier
-    | delegationSpecifiers COMMA delegationSpecifier
-    | delegationSpecifiers NL delegationSpecifier
+ctorParam
+    : modifiers identifier ':' type                    { free($2); }
+    | modifiers identifier ':' type '=' expr           { free($2); }
+    | modifiers VAL identifier ':' type                { free($3); }
+    | modifiers VAR identifier ':' type                { free($3); }
+    | modifiers VAL identifier ':' type '=' expr       { free($3); }
+    | modifiers VAR identifier ':' type '=' expr       { free($3); }
     ;
 
-delegationSpecifier
-    : type opt_typeArguments opt_callArguments
-    | type opt_typeArguments
+opt_supertypes
+    : /* empty */
+    | ':' supertypeList
     ;
 
-opt_callArguments
-    : LPAREN opt_callArgumentList RPAREN
-    | /* empty */
+supertypeList
+    : supertype
+    | supertypeList ',' supertype
     ;
 
-opt_callArgumentList
-    : callArgumentList
-    | /* empty */
-    ;
-
-callArgumentList
-    : expression
-    | callArgumentList COMMA expression
-    | callArgumentList NL expression
+supertype
+    : type
+    | type '(' opt_args ')'
+    | type BY expr           /* "X by delegate" */
     ;
 
 opt_classBody
-    : classBody
-    | /* empty */
+    : /* empty */
+    | classBody
     ;
 
 classBody
-    : LCURL opt_nl opt_classMembers opt_nl RCURL
-    | LCURL opt_nl RCURL
+    : '{' opt_seps '}'
+    | '{' opt_seps members opt_seps '}'
     ;
 
-opt_classMembers
-    : classMembers
-    | /* empty */
+members
+    : member
+    | members seps member
+    | members error sep
+        { yyerrok;   /* error already counted by yyerror; this is just recovery */
+          fprintf(stderr, "         (recovered in class body around line %d)\n", line_num); }
     ;
 
-classMembers
-    : classMember
-    | classMembers separator classMember
+  /* Accessor IS a member - now that get/set are dedicated GET/SET tokens
+   * (not SOFT_KW), accessor-as-member doesn't conflict with modifier-
+   * extending-with-SOFT_KW.
+   */
+member
+    : declaration
+    | initBlock
+    | accessor
+    | secondaryCtor
+    | enumEntries
     ;
 
-classMember
-    : topLevelDeclaration
-    | INIT LCURL opt_nl statements opt_nl RCURL
-    | companionObject
+initBlock
+    : INIT block                                            /* "init { ... }" - INIT is a hard keyword now */
     ;
 
-companionObject
-    : opt_modifiers COMPANION OBJECT simpleIdentifier opt_inheritance opt_classBody
-        { free($4); }
+secondaryCtor
+    : modifiers CONSTRUCTOR '(' opt_ctorParams ')' opt_ctorDelegation opt_funBody  /* CONSTRUCTOR is hard kw */
     ;
-
-/* ============================================================================ */
-/* OBJECT DECLARATION */
-/* ============================================================================ */
-
-objectDeclaration
-    : opt_modifiers OBJECT simpleIdentifier opt_inheritance opt_classBody
-        { printf("[Line %d] Object: %s\n", yylineno, $3); add_declaration($3, yylineno); free($3); }
+opt_ctorParams
+    : /* empty */
+    | ctorParamList
     ;
-
-/* ============================================================================ */
-/* INTERFACE DECLARATION */
-/* ============================================================================ */
-
-interfaceDeclaration
-    : opt_modifiers INTERFACE simpleIdentifier opt_typeParameters opt_inheritance opt_classBody
-        { printf("[Line %d] Interface: %s\n", yylineno, $3); add_declaration($3, yylineno); free($3); }
-    ;
-
-/* ============================================================================ */
-/* ENUM DECLARATION */
-/* ============================================================================ */
-
-enumDeclaration
-    : opt_modifiers ENUM CLASS simpleIdentifier opt_typeParameters opt_inheritance enumBody
-        { printf("[Line %d] Enum: %s\n", yylineno, $4); add_declaration($4, yylineno); free($4); }
-    | opt_modifiers ENUM CLASS simpleIdentifier opt_typeParameters opt_primaryConstructor
-      opt_inheritance enumBody
-        { printf("[Line %d] Enum: %s\n", yylineno, $4); add_declaration($4, yylineno); free($4); }
-    ;
-
-enumBody
-    : LCURL opt_nl opt_enumEntries opt_enumBody_rest opt_nl RCURL
-    | LCURL opt_nl RCURL
-    ;
-
-opt_enumEntries
-    : enumEntries
-    | /* empty */
+opt_ctorDelegation
+    : /* empty */
+    | ':' THIS '(' opt_args ')'
+    | ':' SUPER '(' opt_args ')'
     ;
 
 enumEntries
     : enumEntry
-    | enumEntries COMMA enumEntry
-    | enumEntries NL enumEntry
+    | enumEntries ',' opt_seps enumEntry          /* allow newline after comma */
     ;
 
+  /* enum entries: only IDENTIFIER (not soft keywords) - so SOFT_KW
+   * doesn't reduce to identifier here and conflict with accessor/initBlock.
+   */
 enumEntry
-    : opt_modifiers simpleIdentifier opt_callArguments opt_enumBody
-        { free($2); }
+    : modifiers IDENTIFIER                              { free($2); }
+    | modifiers IDENTIFIER '(' opt_args ')'             { free($2); }
+    | modifiers IDENTIFIER '(' opt_args ')' classBody   { free($2); }
+    | modifiers IDENTIFIER classBody                    { free($2); }
     ;
 
-opt_enumBody
-    : LCURL opt_nl opt_classMembers opt_nl RCURL
-    | /* empty */
+funDecl
+    : modifiers FUN opt_typeParams funHead '(' opt_paramList opt_comma ')' opt_retType opt_whereClause opt_funBody
+        { printf("[Line %d] Function declared\n", line_num); add_decl("fun", "<fn>", line_num); }
     ;
 
-opt_enumBody_rest
-    : SEMICOLON opt_nl opt_classMembers
-    | /* empty */
+  /* funHead absorbs both 'name' and 'receiverType.name' and 'A<T>.name'.
+   * The last identifier is the function name; the rest (if any) is the
+   * receiver type. We don't separate them for validation purposes.
+   */
+funHead
+    : identifier                                          { free($1); }
+    | funHead '.' identifier                              { free($3); }
+    | funHead '<' typeArgList opt_comma '>'
+    | funHead '?'
     ;
 
-/* ============================================================================ */
-/* TYPE ALIAS */
-/* ============================================================================ */
-
-typeAliasDeclaration
-    : opt_modifiers TYPE_ALIAS simpleIdentifier opt_typeParameters ASSIGNMENT type
-        { free($3); }
+opt_paramList
+    : /* empty */
+    | paramList
     ;
 
-/* ============================================================================ */
-/* FUNCTION DECLARATION */
-/* ============================================================================ */
-
-functionDeclaration
-    : opt_modifiers FUN opt_typeParameters opt_receiverType simpleIdentifier
-      LPAREN opt_functionParameters RPAREN opt_colonType opt_typeConstraints opt_functionBody
-        { printf("[Line %d] Function: %s\n", yylineno, $5); add_declaration($5, yylineno); free($5); }
+paramList
+    : param
+    | paramList ',' param
     ;
 
-opt_receiverType
-    : type DOT
-    | /* empty */
+param
+    : modifiers identifier ':' type                  { free($2); }
+    | modifiers identifier ':' type '=' expr         { free($2); }
     ;
 
-opt_functionParameters
-    : functionParameterList
-    | /* empty */
+opt_retType
+    : /* empty */
+    | ':' type
     ;
 
-functionParameterList
-    : functionParameter
-    | functionParameterList COMMA functionParameter
-    | functionParameterList NL functionParameter
-    ;
-
-functionParameter
-    : opt_modifiers simpleIdentifier COLON type opt_equalExpression
-        { free($2); }
-    | opt_modifiers simpleIdentifier opt_equalExpression
-        { free($2); }
-    ;
-
-opt_colonType
-    : COLON type
-    | /* empty */
-    ;
-
-opt_typeConstraints
-    : typeConstraints
-    | /* empty */
-    ;
-
-typeConstraints
-    : WHERE typeConstraintList
+opt_whereClause
+    : /* empty */
+    | SOFT_KW typeConstraintList   /* "where" */
     ;
 
 typeConstraintList
     : typeConstraint
-    | typeConstraintList COMMA typeConstraint
+    | typeConstraintList ',' typeConstraint
     ;
 
 typeConstraint
-    : simpleIdentifier COLON type
-        { free($1); }
+    : identifier ':' type   { free($1); }
     ;
 
-opt_functionBody
-    : functionBody
-    | /* empty */
+opt_funBody
+    : /* empty */
+    | block
+    | '=' expr
     ;
 
-functionBody
-    : LCURL opt_nl statements opt_nl RCURL
-    | LCURL opt_nl RCURL
-    | ASSIGNMENT expression
+propDecl
+    : modifiers VAL declTarget opt_init opt_accessors
+        { printf("[Line %d] Val\n", line_num); add_decl("val", "<val>", line_num); }
+    | modifiers VAR declTarget opt_init opt_accessors
+        { printf("[Line %d] Var\n", line_num); add_decl("var", "<var>", line_num); }
     ;
 
-/* ============================================================================ */
-/* PROPERTY DECLARATION */
-/* ============================================================================ */
-
-propertyDeclaration
-    : opt_modifiers val_or_var simpleIdentifier opt_typeParameters opt_colonType
-      opt_propertyInitializer opt_propertyAccessors
-        { free($3); }
+declTarget
+    : identifier                            { free($1); }
+    | identifier ':' type                   { free($1); }
+    | '(' destructList ')'
+    | '(' destructList ')' ':' type
     ;
 
-val_or_var
-    : VAL
-    | VAR
+destructList
+    : identifier                            { free($1); }
+    | identifier ':' type                   { free($1); }
+    | destructList ',' identifier           { free($3); }
+    | destructList ',' identifier ':' type  { free($3); }
     ;
 
-opt_typeParameters
-    : typeParameters
-    | /* empty */
+opt_init
+    : /* empty */
+    | '=' expr
+    | BY expr          /* "by delegate" - BY is a hard keyword now */
     ;
 
-opt_colonType_arg
-    : COLON type
-    | /* empty */
+opt_accessors
+    : /* empty */
+    | accessor
+    | accessor accessor
     ;
 
-opt_propertyInitializer
-    : ASSIGNMENT expression
-    | propertyDelegate
-    | /* empty */
+  /* accessor: get/set declaration. GET/SET are dedicated hard keywords. */
+accessor
+    : GET '(' ')' opt_retType opt_funBody
+    | SET '(' identifier ')' opt_funBody                { free($3); }
+    | SET '(' identifier ':' type ')' opt_funBody       { free($3); }
+    | GET                                                /* short form: `val x get() = ...` — not really common, but parsed */
+    | SET                                                /* analogous */
     ;
 
-propertyDelegate
-    : BY expression
+typeAliasDecl
+    : modifiers TYPEALIAS identifier opt_typeParams '=' type
+        { printf("[Line %d] Typealias: %s\n", line_num, $3); add_decl("typealias", $3, line_num); free($3); }
     ;
 
-opt_propertyAccessors
-    : propertyAccessors
-    | /* empty */
+/* ============================================================== */
+/* Types                                                           */
+/* ============================================================== */
+
+  /* Note: standalone parenthesized type `(T)` is intentionally not a rule
+   * because it overlaps with the function-type prefix `(T1, T2) -> R` and
+   * LALR can't disambiguate until it sees ARROW (or its absence). The
+   * shift-reduce here defaults to shift, so function types win.
+   * In Kotlin the parenthesized form is rare and can usually be omitted.
+   */
+type
+    : typeRef
+    | typeRef '?'
+    | '(' opt_typeArgList opt_comma ')' ARROW type    /* function type */
+    | typeRef '.' '(' opt_typeArgList opt_comma ')' ARROW type
     ;
 
-propertyAccessors
-    : getter
-    | setter
-    | getter setter
-    | setter getter
+typeRef
+    : qualifiedName                          { free($1); }
+    | qualifiedName '<' typeArgList opt_comma '>'   { free($1); }
+    | typeRef '.' identifier                 { free($3); }
+    | typeRef '.' identifier '<' typeArgList opt_comma '>'  { free($3); }
     ;
 
-getter
-    : opt_modifiers GET opt_propertyBody
+opt_typeArgList
+    : /* empty */
+    | typeArgList
     ;
 
-setter
-    : opt_modifiers SET opt_setterParameter opt_propertyBody
+typeArgList
+    : typeArgItem
+    | typeArgList ',' typeArgItem
     ;
 
-opt_setterParameter
-    : LPAREN setterParameter RPAREN
-    | /* empty */
+typeArgItem
+    : type
+    | '*'
+    | SOFT_KW type    /* "out T" or "in T" - SOFT_KW is "out" */
+    | IN type
     ;
 
-setterParameter
-    : simpleIdentifier
-    | /* empty */
-        { free($1); }
+/* ============================================================== */
+/* Block / statements                                              */
+/* ============================================================== */
+
+block
+    : '{' opt_seps '}'
+    | '{' opt_seps stmts opt_seps '}'
     ;
 
-opt_propertyBody
-    : LCURL statements RCURL
-    | ASSIGNMENT expression
-    | /* empty */
+stmts
+    : stmt
+    | stmts seps stmt
+    | stmts error sep
+        { yyerrok;   /* error already counted by yyerror; this is just recovery */
+          fprintf(stderr, "         (recovered in block around line %d)\n", line_num); }
     ;
 
-/* ============================================================================ */
-/* STATEMENTS */
-/* ============================================================================ */
-
-statements
-    : opt_statementList
-    | semis
-    | opt_statementList semis
-    ;
-
-opt_statementList
-    : statementList
-    | /* empty */
-    ;
-
-statementList
-    : statement
-    | statementList semis statement
-    ;
-
-semis
-    : SEMICOLON
-    | NL
-    | semis SEMICOLON
-    | semis NL
-    ;
-
-statement
-    : opt_statementPrefix statementContent
-    ;
-
-opt_statementPrefix
-    : statementPrefix
-    | /* empty */
-    ;
-
-statementPrefix
-    : annotationList
-    | label
-    ;
-
-label
-    : simpleIdentifier AT
-        { free($1); }
-    ;
-
-statementContent
+  /* stmt level: declarations, control flow, assignments, and expressions.
+   * RETURN/BREAK/CONTINUE/THROW were moved to primary so they're usable
+   * inside expressions like `if (x) continue` and `if (x) return v`.
+   */
+stmt
     : declaration
-    | assignment
-    | loopStatement
-    | jumpStatement
-    | tryStatement
-    | expression
+    | expr
+    | expr '=' expr
+    | expr PLUS_EQ expr
+    | expr MINUS_EQ expr
+    | expr STAR_EQ expr
+    | expr SLASH_EQ expr
+    | expr MOD_EQ expr
+    | forStmt
+    | whileStmt
+    | doWhileStmt
+    | labelStmt
     ;
 
-assignment
-    : assignableExpression ASSIGNMENT expression
-    | assignableExpression ADD_ASSIGN expression
-    | assignableExpression SUB_ASSIGN expression
-    | assignableExpression MULT_ASSIGN expression
-    | assignableExpression DIV_ASSIGN expression
-    | assignableExpression MOD_ASSIGN expression
+labelStmt
+    : IDENTIFIER '@' stmt        { free($1); }
     ;
 
-assignableExpression
-    : simpleIdentifier
-    | parenthesizedAssignableExpression
-    | assignableExpression DOT simpleIdentifier
-    | assignableExpression LBRACK expression RBRACK
+forStmt
+    : FOR '(' forVar IN expr ')' stmt
+    | FOR '(' forVar IN expr ')' ';'
     ;
 
-parenthesizedAssignableExpression
-    : LPAREN assignableExpression RPAREN
+forVar
+    : modifiers identifier                  { free($2); }
+    | modifiers identifier ':' type         { free($2); }
+    | '(' destructList ')'
     ;
 
-loopStatement
-    : forStatement
-    | whileStatement
-    | doWhileStatement
+whileStmt
+    : WHILE '(' expr ')' stmt
+    | WHILE '(' expr ')' ';'
     ;
 
-forStatement
-    : FOR LPAREN variableDeclaration IN expression RPAREN controlStructureBody
+doWhileStmt
+    : DO stmt WHILE '(' expr ')'
     ;
 
-whileStatement
-    : WHILE LPAREN expression RPAREN controlStructureBody
-    | WHILE LPAREN expression RPAREN SEMICOLON
+/* ============================================================== */
+/* Expressions                                                     */
+/* ============================================================== */
+
+expr
+    : expr OROR expr
+    | expr ANDAND expr
+    | expr EQEQ expr
+    | expr NEQ expr
+    | expr EQEQEQ expr
+    | expr NEQEQ expr
+    | expr '<' expr
+    | expr '>' expr
+    | expr LEQ expr
+    | expr GEQ expr
+    | expr IN expr
+    | expr NOT_IN expr
+    | expr IS type
+    | expr NOT_IS type
+    | expr AS type
+    | expr AS_SAFE type
+    | expr RANGE expr
+    | expr RANGE_UNTIL expr
+    | expr ELVIS expr
+    | expr IDENTIFIER expr  %prec INFIX_FN              /* infix function call */
+    | expr SOFT_KW expr     %prec INFIX_FN              /* infix using soft keyword name */
+    | expr '+' expr
+    | expr '-' expr
+    | expr '*' expr
+    | expr '/' expr
+    | expr '%' expr
+    | '-' expr %prec UMINUS
+    | '+' expr %prec UPLUS
+    | '!' expr
+    | INCR expr
+    | DECR expr
+    | expr INCR
+    | expr DECR
+    | expr DBL_EXCL
+    | expr '.' identifier                           { free($3); }
+    | expr SAFE_DOT identifier                      { free($3); }
+    | expr COLONCOLON identifier                    { free($3); }
+    | expr COLONCOLON CLASS
+    | expr '(' opt_args ')'
+    | expr '(' opt_args ')' lambda
+    | expr lambda
+    | expr '[' argList ']'
+    | primary
     ;
 
-doWhileStatement
-    : DO controlStructureBody WHILE LPAREN expression RPAREN
+primary
+    : INT_LIT                                    { free($1); }
+    | REAL_LIT                                   { free($1); }
+    | STRING_LIT                                 { free($1); }
+    | CHAR_LIT                                   { free($1); }
+    | BOOL_LIT                                   { free($1); }
+    | NULL_LIT
+    | identifier                                 { free($1); }
+    | THIS
+    | THIS '@' identifier                        { free($3); }
+    | SUPER
+    | SUPER '@' identifier                       { free($3); }
+    | SUPER '<' type '>'
+    | '(' expr ')'
+    | lambda
+    | ifExpr
+    | whenExpr
+    | tryExpr
+    | objectLit
+    | COLONCOLON identifier                      { free($2); }
+    | COLONCOLON CLASS
+    | jumpExpr                                   /* break/continue/return/throw as expressions */
     ;
 
-controlStructureBody
-    : LCURL opt_nl statements opt_nl RCURL
-    | statement
-    ;
-
-jumpStatement
-    : RETURN
-    | RETURN expression
-    | THROW expression
+  /* jump-expressions usable anywhere an expression is allowed */
+jumpExpr
+    : RETURN                                  %prec UMINUS
+    | RETURN expr                             %prec UMINUS
+    | RETURN '@' identifier                   %prec UMINUS  { free($3); }
+    | RETURN '@' identifier expr              %prec UMINUS  { free($3); }
     | BREAK
     | CONTINUE
-    | label BREAK
-        { free($1); }
-    | label CONTINUE
-        { free($1); }
+    | BREAK '@' identifier                                  { free($3); }
+    | CONTINUE '@' identifier                               { free($3); }
+    | THROW expr                              %prec UMINUS
     ;
 
-tryStatement
-    : TRY block catchBlocks finallyBlock
-    | TRY block catchBlocks
-    | TRY block finallyBlock
+/* lambdas: either statements only, or "params -> stmts" */
+lambda
+    : '{' opt_seps '}'
+    | '{' opt_seps stmts opt_seps '}'
+    | '{' opt_seps lambdaParamList ARROW opt_seps '}'
+    | '{' opt_seps lambdaParamList ARROW opt_seps stmts opt_seps '}'
+    | '{' opt_seps ARROW opt_seps '}'
+    | '{' opt_seps ARROW opt_seps stmts opt_seps '}'
     ;
 
-catchBlocks
-    : catchBlock
-    | catchBlocks catchBlock
+lambdaParamList
+    : lambdaParam
+    | lambdaParamList ',' lambdaParam
     ;
 
-catchBlock
-    : CATCH LPAREN variableDeclaration RPAREN block
+lambdaParam
+    : IDENTIFIER                               { free($1); }
+    | IDENTIFIER ':' type                      { free($1); }
+    | '(' destructList ')'
+    | '_'      /* underscore is just IDENTIFIER, kept here for documentation */
     ;
 
-finallyBlock
-    : FINALLY block
+ifExpr
+    : IF '(' expr ')' expr                  %prec THEN
+    | IF '(' expr ')' expr ELSE expr
     ;
 
-/* ============================================================================ */
-/* EXPRESSIONS */
-/* ============================================================================ */
-
-expression
-    : disjunction
-    | ifExpression
-    | whenExpression
-    | tryExpression
-    | lambdaExpression
-    ;
-
-ifExpression
-    : IF LPAREN expression RPAREN controlStructureBody %prec IF
-    | IF LPAREN expression RPAREN controlStructureBody ELSE controlStructureBody
-    ;
-
-whenExpression
-    : WHEN LPAREN expression RPAREN LCURL opt_nl whenEntries opt_nl RCURL
-    | WHEN LCURL opt_nl whenEntries opt_nl RCURL
+whenExpr
+    : WHEN '{' opt_seps '}'
+    | WHEN '{' opt_seps whenEntries opt_seps '}'
+    | WHEN '(' expr ')' '{' opt_seps '}'
+    | WHEN '(' expr ')' '{' opt_seps whenEntries opt_seps '}'
+    | WHEN '(' VAL identifier '=' expr ')' '{' opt_seps whenEntries opt_seps '}'              { free($4); }
+    | WHEN '(' VAL identifier ':' type '=' expr ')' '{' opt_seps whenEntries opt_seps '}'     { free($4); }
     ;
 
 whenEntries
     : whenEntry
-    | whenEntries NL whenEntry
-    | whenEntries COMMA whenEntry
+    | whenEntries seps whenEntry
     ;
 
 whenEntry
-    : whenCondition ARROW controlStructureBody
-    | ELSE ARROW controlStructureBody
+    : whenCondList ARROW stmt
+    | ELSE ARROW stmt
     ;
 
-whenCondition
-    : expression
-    | whenCondition COMMA expression
+whenCondList
+    : whenCond
+    | whenCondList ',' whenCond
     ;
 
-tryExpression
-    : TRY expression catchBlocks finallyBlock
-    | TRY expression catchBlocks
-    | TRY expression finallyBlock
+whenCond
+    : expr
+    | IN expr
+    | NOT_IN expr
+    | IS type
+    | NOT_IS type
     ;
 
-lambdaExpression
-    : LCURL opt_nl opt_lambdaParameters ARROW opt_nl statements opt_nl RCURL
+tryExpr
+    : TRY block catchList
+    | TRY block catchList FINALLY block
+    | TRY block FINALLY block
     ;
 
-opt_lambdaParameters
-    : lambdaParameterList
-    | /* empty */
+catchList
+    : catchClause
+    | catchList catchClause
     ;
 
-lambdaParameterList
-    : lambdaParameter
-    | lambdaParameterList COMMA lambdaParameter
+catchClause
+    : CATCH '(' opt_modifiers identifier ':' type ')' block   { free($4); }
     ;
-
-lambdaParameter
-    : variableDeclaration
-    ;
-
-variableDeclaration
-    : simpleIdentifier
-    | simpleIdentifier COLON type
-        { free($1); }
-    ;
-
-disjunction
-    : conjunction
-    | disjunction OROR conjunction
-    ;
-
-conjunction
-    : equality
-    | conjunction ANDAND equality
-    ;
-
-equality
-    : comparison
-    | equality EQEQ comparison
-    | equality EXCL_EQ comparison
-    | equality EQEQEQ comparison
-    | equality EXCL_EQEQ comparison
-    ;
-
-comparison
-    : inclusionCheck
-    | comparison LANGLE inclusionCheck
-    | comparison RANGLE inclusionCheck
-    | comparison LE inclusionCheck
-    | comparison GE inclusionCheck
-    ;
-
-inclusionCheck
-    : typeCheck
-    | inclusionCheck IN typeCheck
-    | inclusionCheck NOT_IN typeCheck
-    ;
-
-typeCheck
-    : range
-    | typeCheck IS type
-    | typeCheck NOT_IS type
-    | typeCheck AS type
-    | typeCheck AS_SAFE type
-    ;
-
-range
-    : additiveExpression
-    | range RANGE additiveExpression
-    | range RANGE_UNTIL additiveExpression
-    | range ELVIS additiveExpression
-    ;
-
-additiveExpression
-    : multiplicativeExpression
-    | additiveExpression ADD multiplicativeExpression
-    | additiveExpression SUB multiplicativeExpression
-    ;
-
-multiplicativeExpression
-    : unaryExpression
-    | multiplicativeExpression MULT unaryExpression
-    | multiplicativeExpression DIV unaryExpression
-    | multiplicativeExpression MOD unaryExpression
-    ;
-
-unaryExpression
-    : prefixUnaryExpression
-    | postfixExpression
-    ;
-
-prefixUnaryExpression
-    : INCR unaryExpression
-    | DECR unaryExpression
-    | ADD unaryExpression
-    | SUB unaryExpression
-    | NOT unaryExpression
-    ;
-
-postfixExpression
-    : primaryExpression
-    | postfixExpression postfixUnarySuffix %prec CALL_SUFFIX
-    | postfixExpression INCR
-    | postfixExpression DECR
-    | postfixExpression DOUBLE_EXCL
-    ;
-
-postfixUnarySuffix
-    : DOT simpleIdentifier
-    | DOT functionCall
-    | SAFE_DOT simpleIdentifier
-    | SAFE_DOT functionCall
-    | DOUBLE_COLON simpleIdentifier
-    | DOUBLE_COLON CLASS
-    | LBRACK expression RBRACK
-    | functionCall
-    | typeArguments
-    | lambdaExpression
-    ;
-
-functionCall
-    : LPAREN opt_callArgumentList RPAREN
-    ;
-
-opt_typeArguments
-    : typeArguments
-    | /* empty */
-    ;
-
-typeArguments
-    : LANGLE typeArgumentList RANGLE
-    ;
-
-typeArgumentList
-    : typeArgument
-    | typeArgumentList COMMA typeArgument
-    ;
-
-typeArgument
-    : type
-    | varianceModifier type
-    ;
-
-varianceModifier
-    : OUT
-    | IN
-    ;
-
-primaryExpression
-    : parenthesizedExpression
-    | simpleIdentifier
-    | functionLiteral
-    | THIS
-    | SUPER
-    | literalConstant
-    | stringLiteral
-    | collectionLiteral
-    | callableReference
-    ;
-
-parenthesizedExpression
-    : LPAREN expression RPAREN
-    ;
-
-functionLiteral
-    : LCURL opt_nl statements opt_nl RCURL
-    ;
-
-literalConstant
-    : INTEGER_LITERAL
-    | REAL_LITERAL
-    | HEX_LITERAL
-    | BIN_LITERAL
-    | LONG_LITERAL
-    | UNSIGNED_LITERAL
-    | CHARACTER_LITERAL
-    | TRUE
-    | FALSE
-    | NULL_LITERAL
-    ;
-
-stringLiteral
-    : QUOTE stringContent QUOTE
-    | QUOTE QUOTE
-    ;
-
-stringContent
-    : stringPart
-    | stringContent stringPart
-    ;
-
-stringPart
-    : STRING_LITERAL
-    | DOLLAR simpleIdentifier
-    | DOLLAR_LBRACE expression RCURL
-    ;
-
-collectionLiteral
-    : LBRACK opt_collectionElements RBRACK
-    ;
-
-opt_collectionElements
-    : collectionElements
-    | /* empty */
-    ;
-
-collectionElements
-    : expression
-    | collectionElements COMMA expression
-    | collectionElements NL expression
-    ;
-
-callableReference
-    : DOUBLE_COLON simpleIdentifier
-    | type DOUBLE_COLON simpleIdentifier
-    | type DOUBLE_COLON CLASS
-    ;
-
-/* ============================================================================ */
-/* TYPES */
-/* ============================================================================ */
-
-type
-    : typeReference opt_typeModifiers
-        { $$ = $1; }
-    ;
-
-opt_typeModifiers
-    : typeModifiers
-    | /* empty */
-    ;
-
-typeModifiers
-    : typeModifier
-    | typeModifiers typeModifier
-    ;
-
-typeModifier
-    : QUEST
-    | AMPER
-    ;
-
-typeReference
-    : annotationList type
-    | userType
-    | nullableType
-    | functionType
-    ;
-
-nullableType
-    : typeReference QUEST
-    ;
-
-userType
-    : simpleIdentifier opt_typeArguments
-        { $$ = $1; }
-    | userType DOT simpleIdentifier opt_typeArguments
-        { 
-            char* res = malloc(strlen($1) + strlen($3) + 2);
-            sprintf(res, "%s.%s", $1, $3);
-            free($1); free($3);
-            $$ = res;
-        }
-    ;
-
-typeParameters
-    : LANGLE typeParameterList RANGLE
-    ;
-
-typeParameterList
-    : typeParameter
-    | typeParameterList COMMA typeParameter
-    ;
-
-typeParameter
-    : opt_typeParameterModifiers simpleIdentifier opt_colonType
-        { free($2); }
-    ;
-
-opt_typeParameterModifiers
-    : typeParameterModifiers
-    | /* empty */
-    ;
-
-typeParameterModifiers
-    : typeParameterModifier
-    | typeParameterModifiers typeParameterModifier
-    ;
-
-typeParameterModifier
-    : REIFIED
-    | varianceModifier
-    ;
-
-functionType
-    : LPAREN opt_functionTypeParameters RPAREN ARROW type
-    ;
-
-opt_functionTypeParameters
-    : functionTypeParameterList
-    | /* empty */
-    ;
-
-functionTypeParameterList
-    : type
-    | functionTypeParameterList COMMA type
-    ;
-
-/* ============================================================================ */
-/* IDENTIFIERS */
-/* ============================================================================ */
-
-identifier
-    : simpleIdentifier
-        { $$ = $1; }
-    | identifier DOT simpleIdentifier
-        {
-            char* res = malloc(strlen($1) + strlen($3) + 2);
-            sprintf(res, "%s.%s", $1, $3);
-            free($1); free($3);
-            $$ = res;
-        }
-    ;
-
-simpleIdentifier
-    : IDENTIFIER
-        { $$ = $1; }
-    | ABSTRACT { $$ = $1; }
-    | ANNOTATION { $$ = $1; }
-    | BY { $$ = $1; }
-    | CATCH { $$ = $1; }
-    | COMPANION { $$ = $1; }
-    | CONSTRUCTOR { $$ = $1; }
-    | CROSSINLINE { $$ = $1; }
-    | DATA { $$ = $1; }
-    | DELEGATE { $$ = $1; }
-    | DYNAMIC { $$ = $1; }
-    | ENUM { $$ = $1; }
-    | EXPECT_LITERAL { $$ = $1; }
-    | EXTERNAL { $$ = $1; }
-    | FIELD { $$ = $1; }
-    | FILE_KW { $$ = $1; }
-    | FINAL { $$ = $1; }
-    | FINALLY { $$ = $1; }
-    | GET { $$ = $1; }
-    | IMPORT { $$ = $1; }
-    | INFIX { $$ = $1; }
-    | INIT { $$ = $1; }
-    | INLINE { $$ = $1; }
-    | INNER { $$ = $1; }
-    | INTERNAL { $$ = $1; }
-    | LATEINIT { $$ = $1; }
-    | NOINLINE { $$ = $1; }
-    | OPEN { $$ = $1; }
-    | OPERATOR { $$ = $1; }
-    | OUT { $$ = $1; }
-    | OVERRIDE { $$ = $1; }
-    | PARAM { $$ = $1; }
-    | PRIVATE { $$ = $1; }
-    | PROPERTY { $$ = $1; }
-    | PROTECTED { $$ = $1; }
-    | PUBLIC { $$ = $1; }
-    | RECEIVER { $$ = $1; }
-    | REIFIED { $$ = $1; }
-    | SEALED { $$ = $1; }
-    | SET { $$ = $1; }
-    | SETPARAM { $$ = $1; }
-    | SUSPEND { $$ = $1; }
-    | TAILREC { $$ = $1; }
-    | VARARG { $$ = $1; }
-    | VALUE { $$ = $1; }
-    | ACTUAL { $$ = $1; }
-    | WHERE { $$ = $1; }
-    | CONST_LITERAL { $$ = $1; }
-    ;
-
-/* ============================================================================ */
-/* MODIFIERS */
-/* ============================================================================ */
 
 opt_modifiers
-    : modifiers
-    | /* empty */
+    : /* empty */
+    | modifiers modifierItem    /* at least one */
     ;
 
-modifiers
-    : modifier
-    | modifiers modifier
+objectLit
+    : OBJECT opt_supertypes classBody
     ;
 
-modifier
-    : ABSTRACT
-    | FINAL
-    | OPEN
-    | PUBLIC
-    | PRIVATE
-    | INTERNAL
-    | PROTECTED
-    | OVERRIDE
-    | LATEINIT
-    | DATA
-    | INLINE
-    | INNER
-    | SEALED
-    | ENUM
-    | TAILREC
-    | EXTERNAL
-    | INFIX
-    | OPERATOR
-    | SUSPEND
-    | EXPECT_LITERAL
-    | ACTUAL
-    | CONST_LITERAL
-    | CROSSINLINE
-    | NOINLINE
-    | REIFIED
-    | VARARG
+opt_args
+    : /* empty */
+    | argList opt_comma
     ;
 
-/* ============================================================================ */
-/* ANNOTATIONS */
-/* ============================================================================ */
-
-annotationList
-    : annotation
-    | annotationList annotation
+argList
+    : arg
+    | argList ',' arg
     ;
 
-annotation
-    : AT simpleIdentifier
-    | AT simpleIdentifier LPAREN opt_callArgumentList RPAREN
-    ;
-
-/* ============================================================================ */
-/* OPTIONAL EXPRESSIONS */
-/* ============================================================================ */
-
-opt_equalExpression
-    : ASSIGNMENT expression
-    | /* empty */
+arg
+    : expr
+    | identifier '=' expr   { free($1); }
+    | '*' expr
     ;
 
 %%
 
 void yyerror(const char *s) {
     error_count++;
-    fprintf(stderr, "Syntax Error at line %d: %s\n", yylineno, s);
+    fprintf(stderr, "[Error #%d] line %d: %s (near '%s')\n",
+            error_count, line_num, s, yytext ? yytext : "?");
+    print_source_line(line_num);
+    fflush(stderr);
 }
 
+static const char *banner =
+"========================================\n"
+"Kotlin Validator - starting analysis\n"
+"========================================\n";
+
 int main(int argc, char **argv) {
+    const char *path = NULL;
     if (argc > 1) {
-        yyin = fopen(argv[1], "r");
-        if (!yyin) {
-            perror(argv[1]);
-            return 1;
-        }
+        path = argv[1];
+        yyin = fopen(path, "r");
+        if (!yyin) { perror(path); return 2; }
+        /* second open is for the source-line cache (yyin is consumed by the lexer) */
+        load_source_lines(path);
     } else {
         yyin = stdin;
     }
-    
-    printf("========================================\n");
-    printf("Kotlin Parser - Starting analysis\n");
-    printf("========================================\n\n");
-    
-    int parse_result = yyparse();
-    
+
+    fputs(banner, stdout);
+    if (path) printf("Source: %s\n", path);
+    fputc('\n', stdout);
+
+    int rc = yyparse();
+
     printf("\n========================================\n");
     printf("Analysis Report\n");
     printf("========================================\n");
-    printf("Total declarations found: %d\n", decl_count);
-    printf("Total errors found: %d\n", error_count);
-    
+    printf("Declarations found: %d\n", decl_count);
+    printf("Errors reported:    %d\n", error_count);
+
     if (decl_count > 0) {
         printf("\nDeclarations:\n");
         for (int i = 0; i < decl_count; i++) {
-            printf("  Line %d: %s\n", declarations[i].line, declarations[i].name);
+            printf("  line %4d  %-10s  %s\n",
+                   decls[i].line, decls[i].kind, decls[i].name);
         }
     }
-    
+
     printf("\n========================================\n");
-    if (parse_result == 0 && error_count == 0) {
-        printf("Result: SUCCESS - File is valid Kotlin code\n");
+    if (rc == 0 && error_count == 0) {
+        printf("Result: SUCCESS - file is valid Kotlin code.\n");
     } else {
-        printf("Result: FAILURE - File contains errors\n");
+        printf("Result: FAILURE - file contains %d error(s).\n", error_count);
     }
     printf("========================================\n");
-    
-    return (parse_result == 0 && error_count == 0) ? 0 : 1;
+
+    return (rc == 0 && error_count == 0) ? 0 : 1;
 }

@@ -1,3 +1,15 @@
+/*
+ * Kotlin lexer (Flex). Returns tokens consumed by src/parser.y.
+ *
+ * Key trick borrowed from the Go validator in go/lexer.l:
+ *   newlines are emitted as the NL token only when the previous token
+ *   could legally END a statement (identifier, literal, ')', ']', '}',
+ *   '!!', 'return', etc.). After an operator or an opening bracket the
+ *   newline is whitespace. This eliminates spurious NL-in-the-middle-of-
+ *   an-expression ambiguities that crippled the earlier grammar.
+ *
+ * Lexical errors are reported but never abort the scan.
+ */
 %{
 #include <stdio.h>
 #include <string.h>
@@ -5,243 +17,216 @@
 #include "parser.tab.h"
 
 int line_num = 1;
-int col_num = 1;
+int col_num  = 1;
 
-void update_location() {
-    for (int i = 0; yytext[i] != '\0'; i++) {
-        if (yytext[i] == '\n') {
-            line_num++;
-            col_num = 1;
-        } else {
-            col_num++;
-        }
+/* shared with the parser: error count and source-line cache (for nice errors) */
+extern int error_count;
+extern void print_source_line(int line);
+
+/* depth tracking suppresses NL-as-separator inside parens/brackets */
+static int paren_depth   = 0;
+static int bracket_depth = 0;
+
+/* set by emit_token() to remember whether the previous token can end a stmt */
+static int last_can_end_stmt = 0;
+
+static void track_text(const char *s) {
+    for (int i = 0; s[i]; i++) {
+        if (s[i] == '\n') { line_num++; col_num = 1; }
+        else              { col_num++; }
     }
+}
+
+static int token_can_end_stmt(int tok) {
+    switch (tok) {
+        case IDENTIFIER:
+        case SOFT_KW:
+        case STRING_LIT:
+        case INT_LIT:
+        case REAL_LIT:
+        case CHAR_LIT:
+        case BOOL_LIT:
+        case NULL_LIT:
+        case THIS:
+        case SUPER:
+        case RETURN:
+        case BREAK:
+        case CONTINUE:
+        case INCR:
+        case DECR:
+        case DBL_EXCL:
+        case ')':
+        case ']':
+        case '}':
+        case '*':   /* covers `import foo.*` where the trailing `*` ends the stmt */
+        case '>':   /* covers `class Foo<T>` */
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int emit(int tok) {
+    last_can_end_stmt = token_can_end_stmt(tok);
+    return tok;
 }
 %}
 
 %option noyywrap
-%option yylineno
+%option nounput
+%option noinput
 
-/* Patterns */
-NL               (\r\n|\n|\r)
-WS               [ \t\f]+
-DIGIT            [0-9]
-HEX_DIGIT        [0-9a-fA-F]
-BIN_DIGIT        [01]
-IDENTIFIER       [a-zA-Z_][a-zA-Z0-9_]*
-BACKTICK_ID      `[^`\r\n]+`
-INTEGER          {DIGIT}+
-HEX_INTEGER      0[xX]{HEX_DIGIT}+
-BIN_INTEGER      0[bB]{BIN_DIGIT}+
-LONG_INTEGER     {INTEGER}[lL]
-UNSIGNED_INT     {INTEGER}[uU]
-UNSIGNED_LONG    {INTEGER}[uU][lL]
-FLOAT_LITERAL    ({DIGIT}+\.{DIGIT}*|\.{DIGIT}+)([eE][+-]?{DIGIT}+)?[fF]?
-DOUBLE_LITERAL   {DIGIT}+\.{DIGIT}*([eE][+-]?{DIGIT}+)?|{DIGIT}+[eE][+-]?{DIGIT}+
+%x BLOCK_COMMENT
+%x TRIPLE_STR
 
-%x S_STRING TEMPLATE_STRING
+DIGIT   [0-9]
+HEX     [0-9a-fA-F]
+BIN     [01]
+LETTER  [a-zA-Z_]
+IDENT   {LETTER}({LETTER}|{DIGIT})*
 
 %%
 
-{WS}             { col_num += yyleng; }
-{NL}             { line_num++; col_num = 1; return NL; }
+  /* whitespace */
+[ \t\r]+        { col_num += yyleng; }
 
-/* Comments */
-"//".* { }
-"/*" { 
-    int c;
-    int depth = 1;
-    while((c = input()) != 0 && depth > 0) {
-        if (c == '\n') {
-            line_num++;
-            col_num = 1;
-        } else {
-            col_num++;
-        }
-        if (c == '*') {
-            c = input();
-            if (c == '/') {
-                depth--;
-            } else {
-                if (c == '\n') {
-                    line_num++;
-                    col_num = 1;
-                }
-                unput(c);
-            }
-        } else if (c == '/' && input() == '*') {
-            depth++;
-        }
+  /* newlines: only become NL tokens when they actually end a statement */
+\n              {
+    line_num++; col_num = 1;
+    if (last_can_end_stmt && paren_depth == 0 && bracket_depth == 0) {
+        last_can_end_stmt = 0;
+        return NL;
     }
 }
 
-/* Keywords */
-"abstract"      { yylval.str_val = strdup(yytext); return ABSTRACT; }
-"annotation"    { yylval.str_val = strdup(yytext); return ANNOTATION; }
-"as"            { return AS; }
-"as?"           { return AS_SAFE; }
-"break"         { return BREAK; }
-"by"            { yylval.str_val = strdup(yytext); return BY; }
-"catch"         { yylval.str_val = strdup(yytext); return CATCH; }
-"class"         { return CLASS; }
-"companion"     { yylval.str_val = strdup(yytext); return COMPANION; }
-"const"         { yylval.str_val = strdup(yytext); return CONST_LITERAL; }
-"constructor"   { yylval.str_val = strdup(yytext); return CONSTRUCTOR; }
-"continue"      { return CONTINUE; }
-"crossinline"   { yylval.str_val = strdup(yytext); return CROSSINLINE; }
-"data"          { yylval.str_val = strdup(yytext); return DATA; }
-"delegate"      { yylval.str_val = strdup(yytext); return DELEGATE; }
-"do"            { return DO; }
-"dynamic"       { yylval.str_val = strdup(yytext); return DYNAMIC; }
-"else"          { return ELSE; }
-"enum"          { yylval.str_val = strdup(yytext); return ENUM; }
-"expect"        { yylval.str_val = strdup(yytext); return EXPECT_LITERAL; }
-"external"      { yylval.str_val = strdup(yytext); return EXTERNAL; }
-"false"         { return FALSE; }
-"field"         { yylval.str_val = strdup(yytext); return FIELD; }
-"file"          { yylval.str_val = strdup(yytext); return FILE_KW; }
-"final"         { yylval.str_val = strdup(yytext); return FINAL; }
-"finally"       { yylval.str_val = strdup(yytext); return FINALLY; }
-"for"           { return FOR; }
-"fun"           { return FUN; }
-"get"           { yylval.str_val = strdup(yytext); return GET; }
-"if"            { return IF; }
-"import"        { yylval.str_val = strdup(yytext); return IMPORT; }
-"in"            { return IN; }
-"infix"         { yylval.str_val = strdup(yytext); return INFIX; }
-"init"          { yylval.str_val = strdup(yytext); return INIT; }
-"inline"        { yylval.str_val = strdup(yytext); return INLINE; }
-"inner"         { yylval.str_val = strdup(yytext); return INNER; }
-"interface"     { return INTERFACE; }
-"internal"      { yylval.str_val = strdup(yytext); return INTERNAL; }
-"is"            { return IS; }
-"lateinit"      { yylval.str_val = strdup(yytext); return LATEINIT; }
-"noinline"      { yylval.str_val = strdup(yytext); return NOINLINE; }
-"null"          { return NULL_LITERAL; }
-"object"        { return OBJECT; }
-"open"          { yylval.str_val = strdup(yytext); return OPEN; }
-"operator"      { yylval.str_val = strdup(yytext); return OPERATOR; }
-"out"           { yylval.str_val = strdup(yytext); return OUT; }
-"override"      { yylval.str_val = strdup(yytext); return OVERRIDE; }
-"package"       { return PACKAGE; }
-"param"         { yylval.str_val = strdup(yytext); return PARAM; }
-"private"       { yylval.str_val = strdup(yytext); return PRIVATE; }
-"protected"     { yylval.str_val = strdup(yytext); return PROTECTED; }
-"property"      { yylval.str_val = strdup(yytext); return PROPERTY; }
-"public"        { yylval.str_val = strdup(yytext); return PUBLIC; }
-"receiver"      { yylval.str_val = strdup(yytext); return RECEIVER; }
-"reified"       { yylval.str_val = strdup(yytext); return REIFIED; }
-"return"        { return RETURN; }
-"sealed"        { yylval.str_val = strdup(yytext); return SEALED; }
-"set"           { yylval.str_val = strdup(yytext); return SET; }
-"setparam"      { yylval.str_val = strdup(yytext); return SETPARAM; }
-"super"         { return SUPER; }
-"suspend"       { yylval.str_val = strdup(yytext); return SUSPEND; }
-"tailrec"       { yylval.str_val = strdup(yytext); return TAILREC; }
-"this"          { return THIS; }
-"throw"         { return THROW; }
-"true"          { return TRUE; }
-"try"           { return TRY; }
-"typealias"     { return TYPE_ALIAS; }
-"val"           { return VAL; }
-"var"           { return VAR; }
-"vararg"        { yylval.str_val = strdup(yytext); return VARARG; }
-"when"          { return WHEN; }
-"where"         { yylval.str_val = strdup(yytext); return WHERE; }
-"while"         { return WHILE; }
-
-/* Special keywords for soft mode (can be identifiers too) */
-"actual"        { yylval.str_val = strdup(yytext); return ACTUAL; }
-"value"         { yylval.str_val = strdup(yytext); return VALUE; }
-
-/* Operators - Three character */
-"==="           { return EQEQEQ; }
-"!=="           { return EXCL_EQEQ; }
-"!in"           { return NOT_IN; }
-"!is"           { return NOT_IS; }
-"..<"           { return RANGE_UNTIL; }
-"!!"            { return DOUBLE_EXCL; }
-"?."            { return SAFE_DOT; }
-"?:"            { return ELVIS; }
-"::"            { return DOUBLE_COLON; }
-
-/* Operators - Two character */
-"=="            { return EQEQ; }
-"!="            { return EXCL_EQ; }
-"<="            { return LE; }
-">="            { return GE; }
-"&&"            { return ANDAND; }
-"||"            { return OROR; }
-"++"            { return INCR; }
-"--"            { return DECR; }
-"+="            { return ADD_ASSIGN; }
-"-="            { return SUB_ASSIGN; }
-"*="            { return MULT_ASSIGN; }
-"/="            { return DIV_ASSIGN; }
-"%="            { return MOD_ASSIGN; }
-".."            { return RANGE; }
-"->"            { return ARROW; }
-
-/* Single character operators */
-"+"             { return ADD; }
-"-"             { return SUB; }
-"*"             { return MULT; }
-"/"             { return DIV; }
-"%"             { return MOD; }
-"="             { return ASSIGNMENT; }
-"!"             { return NOT; }
-"<"             { return LANGLE; }
-">"             { return RANGLE; }
-"&"             { return AMPER; }
-
-/* Delimiters */
-"("             { return LPAREN; }
-")"             { return RPAREN; }
-"["             { return LBRACK; }
-"]"             { return RBRACK; }
-"{"             { return LCURL; }
-"}"             { return RCURL; }
-"."             { return DOT; }
-","             { return COMMA; }
-":"             { return COLON; }
-";"             { return SEMICOLON; }
-"?"             { return QUEST; }
-"@"             { return AT; }
-
-/* Literals */
-{LONG_INTEGER}          { yylval.str_val = strdup(yytext); return LONG_LITERAL; }
-{UNSIGNED_LONG}         { yylval.str_val = strdup(yytext); return UNSIGNED_LITERAL; }
-{UNSIGNED_INT}          { yylval.str_val = strdup(yytext); return UNSIGNED_LITERAL; }
-{HEX_INTEGER}           { yylval.str_val = strdup(yytext); return HEX_LITERAL; }
-{BIN_INTEGER}           { yylval.str_val = strdup(yytext); return BIN_LITERAL; }
-{DOUBLE_LITERAL}        { yylval.str_val = strdup(yytext); return REAL_LITERAL; }
-{FLOAT_LITERAL}         { yylval.str_val = strdup(yytext); return REAL_LITERAL; }
-{INTEGER}               { yylval.int_val = atoi(yytext); return INTEGER_LITERAL; }
-
-/* String and character literals */
-\"              { BEGIN(TEMPLATE_STRING); return QUOTE; }
-"${"            { return DOLLAR_LBRACE; }
-'.'             { yylval.str_val = strdup(yytext); return CHARACTER_LITERAL; }
-"$"             { return DOLLAR; }
-
-<TEMPLATE_STRING>{
-    "\\\""      { /* escaped quote */ }
-    "\\"        { /* escaped char */ }
-    "\""        { BEGIN(INITIAL); return QUOTE; }
-    "$"         { return DOLLAR; }
+  /* line and block comments (block comments may span lines) */
+"//"[^\n]*      { col_num += yyleng; }
+"/*"            { col_num += 2; BEGIN(BLOCK_COMMENT); }
+<BLOCK_COMMENT>{
+    [^*\n]+     { col_num += yyleng; }
+    "*"+[^*/\n]* { col_num += yyleng; }
+    "*"+"/"     { col_num += yyleng; BEGIN(INITIAL); }
     \n          { line_num++; col_num = 1; }
-    [^"\\\n$]   { /* string content */ }
 }
 
-/* Identifiers */
-{IDENTIFIER}    { yylval.str_val = strdup(yytext); return IDENTIFIER; }
-{BACKTICK_ID}   { yylval.str_val = strdup(yytext); return IDENTIFIER; }
-
-/* Error handling */
-.               { 
-    fprintf(stderr, "Lexical Error at line %d, column %d: Unexpected character '%s'\n", 
-            line_num, col_num, yytext);
-    col_num++;
+  /* triple-quoted strings - opaque content */
+"\"\"\""        { col_num += 3; BEGIN(TRIPLE_STR); }
+<TRIPLE_STR>{
+    "\"\"\""    { col_num += 3; yylval.str = strdup("\"\"\"...\"\"\""); BEGIN(INITIAL); return emit(STRING_LIT); }
+    \n          { line_num++; col_num = 1; }
+    .           { col_num++; }
 }
+
+  /* hard keywords */
+"package"       { track_text(yytext); return emit(PACKAGE); }
+"import"        { track_text(yytext); return emit(IMPORT); }
+"class"         { track_text(yytext); return emit(CLASS); }
+"interface"     { track_text(yytext); return emit(INTERFACE); }
+"object"        { track_text(yytext); return emit(OBJECT); }
+"fun"           { track_text(yytext); return emit(FUN); }
+"val"           { track_text(yytext); return emit(VAL); }
+"var"           { track_text(yytext); return emit(VAR); }
+"if"            { track_text(yytext); return emit(IF); }
+"else"          { track_text(yytext); return emit(ELSE); }
+"when"          { track_text(yytext); return emit(WHEN); }
+"for"           { track_text(yytext); return emit(FOR); }
+"while"         { track_text(yytext); return emit(WHILE); }
+"do"            { track_text(yytext); return emit(DO); }
+"return"        { track_text(yytext); return emit(RETURN); }
+"break"         { track_text(yytext); return emit(BREAK); }
+"continue"      { track_text(yytext); return emit(CONTINUE); }
+"throw"         { track_text(yytext); return emit(THROW); }
+"try"           { track_text(yytext); return emit(TRY); }
+"catch"         { track_text(yytext); return emit(CATCH); }
+"finally"       { track_text(yytext); return emit(FINALLY); }
+"this"          { track_text(yytext); return emit(THIS); }
+"super"         { track_text(yytext); return emit(SUPER); }
+"in"            { track_text(yytext); return emit(IN); }
+"!in"           { track_text(yytext); return emit(NOT_IN); }
+"is"            { track_text(yytext); return emit(IS); }
+"!is"           { track_text(yytext); return emit(NOT_IS); }
+"as"            { track_text(yytext); return emit(AS); }
+"as?"           { track_text(yytext); return emit(AS_SAFE); }
+"typealias"     { track_text(yytext); return emit(TYPEALIAS); }
+"enum"          { track_text(yytext); return emit(ENUM); }
+"init"          { track_text(yytext); return emit(INIT); }
+"constructor"   { track_text(yytext); return emit(CONSTRUCTOR); }
+"by"            { track_text(yytext); return emit(BY); }
+"get"           { track_text(yytext); return emit(GET); }
+"set"           { track_text(yytext); return emit(SET); }
+"true"          { track_text(yytext); yylval.str = strdup("true");  return emit(BOOL_LIT); }
+"false"         { track_text(yytext); yylval.str = strdup("false"); return emit(BOOL_LIT); }
+"null"          { track_text(yytext); return emit(NULL_LIT); }
+
+  /* soft keywords: all returned as the single SOFT_KW token so the
+   * grammar doesn't have to enumerate every soft keyword in every slot.
+   */
+"open"|"final"|"abstract"|"override"|"private"|"public"|"protected"|"internal"|"sealed"|"data"|"inline"|"infix"|"operator"|"suspend"|"tailrec"|"external"|"const"|"lateinit"|"companion"|"where"|"out"|"vararg"|"reified"|"crossinline"|"noinline"|"inner"|"annotation"|"value"|"expect"|"actual"|"field"|"property"|"receiver"|"param"|"setparam"|"delegate"|"file"|"dynamic"   { track_text(yytext); yylval.str = strdup(yytext); return emit(SOFT_KW); }
+
+  /* multi-character operators (longest match first) */
+"==="           { col_num += 3; return emit(EQEQEQ); }
+"!=="           { col_num += 3; return emit(NEQEQ); }
+"=="            { col_num += 2; return emit(EQEQ); }
+"!="            { col_num += 2; return emit(NEQ); }
+"<="            { col_num += 2; return emit(LEQ); }
+">="            { col_num += 2; return emit(GEQ); }
+"&&"            { col_num += 2; return emit(ANDAND); }
+"||"            { col_num += 2; return emit(OROR); }
+"++"            { col_num += 2; return emit(INCR); }
+"--"            { col_num += 2; return emit(DECR); }
+"+="            { col_num += 2; return emit(PLUS_EQ); }
+"-="            { col_num += 2; return emit(MINUS_EQ); }
+"*="            { col_num += 2; return emit(STAR_EQ); }
+"/="            { col_num += 2; return emit(SLASH_EQ); }
+"%="            { col_num += 2; return emit(MOD_EQ); }
+"..<"           { col_num += 3; return emit(RANGE_UNTIL); }
+".."            { col_num += 2; return emit(RANGE); }
+"->"            { col_num += 2; return emit(ARROW); }
+"?."            { col_num += 2; return emit(SAFE_DOT); }
+"?:"            { col_num += 2; return emit(ELVIS); }
+"::"            { col_num += 2; return emit(COLONCOLON); }
+"!!"            { col_num += 2; return emit(DBL_EXCL); }
+
+  /* numeric literals */
+{DIGIT}+\.{DIGIT}+([eE][+-]?{DIGIT}+)?[fF]?    { track_text(yytext); yylval.str = strdup(yytext); return emit(REAL_LIT); }
+"0"[xX]{HEX}+([uU]?[lL]?)                       { track_text(yytext); yylval.str = strdup(yytext); return emit(INT_LIT); }
+"0"[bB]{BIN}+([uU]?[lL]?)                       { track_text(yytext); yylval.str = strdup(yytext); return emit(INT_LIT); }
+{DIGIT}+([uU]?[lL]?)                            { track_text(yytext); yylval.str = strdup(yytext); return emit(INT_LIT); }
+
+  /* string and char literals - opaque, $name interpolation ignored */
+\"([^"\\\n]|\\.)*\"                             { track_text(yytext); yylval.str = strdup(yytext); return emit(STRING_LIT); }
+'([^'\\\n]|\\.)+'                               { track_text(yytext); yylval.str = strdup(yytext); return emit(CHAR_LIT); }
+
+  /* identifiers (including backtick-quoted) */
+{IDENT}         { track_text(yytext); yylval.str = strdup(yytext); return emit(IDENTIFIER); }
+`[^`\n]+`       { track_text(yytext); yylval.str = strdup(yytext); return emit(IDENTIFIER); }
+
+  /* single-character punctuation - track bracket depth for NL suppression */
+"("       { col_num++; paren_depth++;   return emit('('); }
+")"       { col_num++; if (paren_depth)   paren_depth--;   return emit(')'); }
+"["       { col_num++; bracket_depth++; return emit('['); }
+"]"       { col_num++; if (bracket_depth) bracket_depth--; return emit(']'); }
+"{"       { col_num++; return emit('{'); }
+"}"       { col_num++; return emit('}'); }
+"+"       { col_num++; return emit('+'); }
+"-"       { col_num++; return emit('-'); }
+"*"       { col_num++; return emit('*'); }
+"/"       { col_num++; return emit('/'); }
+"%"       { col_num++; return emit('%'); }
+"="       { col_num++; return emit('='); }
+"!"       { col_num++; return emit('!'); }
+"<"       { col_num++; return emit('<'); }
+">"       { col_num++; return emit('>'); }
+"&"       { col_num++; return emit('&'); }
+"|"       { col_num++; return emit('|'); }
+"?"       { col_num++; return emit('?'); }
+"."       { col_num++; return emit('.'); }
+","       { col_num++; return emit(','); }
+":"       { col_num++; return emit(':'); }
+";"       { col_num++; last_can_end_stmt = 0; return ';'; }
+"@"       { col_num++; return emit('@'); }
+
+  /* anything else is a lexical error - reported but not fatal */
+.   { error_count++; fprintf(stderr, "[Error #%d] line %d, col %d: unexpected character '%s' (lexical)\n", error_count, line_num, col_num, yytext); print_source_line(line_num); fflush(stderr); col_num++; }
 
 %%
