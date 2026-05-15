@@ -264,12 +264,12 @@ ctorParamList
     ;
 
 ctorParam
-    : modifiers opt_seps identifier ':' type                    { free($3); }
-    | modifiers opt_seps identifier ':' type '=' expr           { free($3); }
-    | modifiers opt_seps VAL identifier ':' type                { free($4); }
-    | modifiers opt_seps VAR identifier ':' type                { free($4); }
-    | modifiers opt_seps VAL identifier ':' type '=' expr       { free($4); }
-    | modifiers opt_seps VAR identifier ':' type '=' expr       { free($4); }
+    : modifiers opt_seps identifier ':' type { free($3); }
+    | modifiers opt_seps identifier ':' type '=' expr { free($3); }
+    | modifiers opt_seps VAL identifier ':' type { free($4); }
+    | modifiers opt_seps VAR identifier ':' type { free($4); }
+    | modifiers opt_seps VAL identifier ':' type '=' expr { free($4); }
+    | modifiers opt_seps VAR identifier ':' type '=' expr { free($4); }
     ;
 
 opt_supertypes
@@ -285,7 +285,7 @@ supertypeList
 supertype
     : type
     | type '(' opt_args ')'
-    | type BY expr           /* "X by delegate" */
+    | type BY expr
     ;
 
 opt_classBody
@@ -302,7 +302,7 @@ members
     : member
     | members seps member
     | members error sep
-        { yyerrok;   /* error already counted by yyerror; this is just recovery */
+        { yyerrok;
           fprintf(stderr, "         (recovered in class body around line %d)\n", line_num); }
     ;
 
@@ -315,11 +315,11 @@ member
     ;
 
 initBlock
-    : INIT block                                            /* "init { ... }" - INIT is a hard keyword now */
+    : INIT block
     ;
 
 secondaryCtor
-    : modifiers opt_seps CONSTRUCTOR '(' opt_ctorParams ')' opt_ctorDelegation opt_funBody  /* CONSTRUCTOR is hard kw */
+    : modifiers opt_seps CONSTRUCTOR '(' opt_ctorParams ')' opt_ctorDelegation opt_funBody
     ;
 opt_ctorParams
     : /* empty */
@@ -333,14 +333,14 @@ opt_ctorDelegation
 
 enumEntries
     : enumEntry
-    | enumEntries ',' opt_seps enumEntry          /* allow newline after comma */
+    | enumEntries ',' opt_seps enumEntry
     ;
 
 enumEntry
-    : modifiers opt_seps IDENTIFIER                              { free($3); }
-    | modifiers opt_seps IDENTIFIER '(' opt_args ')'             { free($3); }
-    | modifiers opt_seps IDENTIFIER '(' opt_args ')' classBody   { free($3); }
-    | modifiers opt_seps IDENTIFIER classBody                    { free($3); }
+    : modifiers opt_seps IDENTIFIER { free($3); }
+    | modifiers opt_seps IDENTIFIER '(' opt_args ')' { free($3); }
+    | modifiers opt_seps IDENTIFIER '(' opt_args ')' classBody { free($3); }
+    | modifiers opt_seps IDENTIFIER classBody { free($3); }
     ;
 
 funDecl
@@ -349,8 +349,8 @@ funDecl
     ;
 
 funHead
-    : identifier                                          { free($1); }
-    | funHead '.' identifier                              { free($3); }
+    : identifier { free($1); }
+    | funHead '.' identifier { free($3); }
     | funHead '<' typeArgList opt_comma '>'
     | funHead '?'
     ;
@@ -366,8 +366,8 @@ paramList
     ;
 
 param
-    : modifiers opt_seps identifier ':' type                  { free($3); }
-    | modifiers opt_seps identifier ':' type '=' expr         { free($3); }
+    : modifiers opt_seps identifier ':' type { free($3); }
+    | modifiers opt_seps identifier ':' type '=' expr { free($3); }
     ;
 
 opt_retType
@@ -377,7 +377,7 @@ opt_retType
 
 opt_whereClause
     : /* empty */
-    | SOFT_KW typeConstraintList   /* "where" */
+    | SOFT_KW typeConstraintList
     ;
 
 typeConstraintList
@@ -386,7 +386,7 @@ typeConstraintList
     ;
 
 typeConstraint
-    : identifier ':' type   { free($1); }
+    : identifier ':' type { free($1); }
     ;
 
 opt_funBody
@@ -403,17 +403,17 @@ propDecl
     ;
 
 declTarget
-    : identifier                            { free($1); }
-    | identifier ':' type                   { free($1); }
+    : identifier { free($1); }
+    | identifier ':' type { free($1); }
     | '(' destructList ')'
     | '(' destructList ')' ':' type
     ;
 
 destructList
-    : identifier                            { free($1); }
-    | identifier ':' type                   { free($1); }
-    | destructList ',' identifier           { free($3); }
-    | destructList ',' identifier ':' type  { free($3); }
+    : identifier { free($1); }
+    | identifier ':' type { free($1); }
+    | destructList ',' identifier { free($3); }
+    | destructList ',' identifier ':' type { free($3); }
     ;
 
 opt_init
@@ -430,10 +430,10 @@ opt_accessors
 
 accessor
     : GET '(' ')' opt_retType opt_funBody
-    | SET '(' identifier ')' opt_funBody                { free($3); }
-    | SET '(' identifier ':' type ')' opt_funBody       { free($3); }
-    | GET                                                /* short form: `val x get() = ...` — not really common, but parsed */
-    | SET                                                /* analogous */
+    | SET '(' identifier ')' opt_funBody { free($3); }
+    | SET '(' identifier ':' type ')' opt_funBody { free($3); }
+    | GET
+    | SET
     ;
 
 typeAliasDecl
@@ -447,7 +447,7 @@ typeAliasDecl
 type
     : typeRef
     | typeRef '?'
-    | '(' opt_typeArgList opt_comma ')' ARROW type    /* function type */
+    | '(' opt_typeArgList opt_comma ')' ARROW type
     | typeRef '.' '(' opt_typeArgList opt_comma ')' ARROW type
     ;
 
@@ -471,7 +471,7 @@ typeArgList
 typeArgItem
     : type
     | '*'
-    | SOFT_KW type    /* "out T" or "in T" - SOFT_KW is "out" */
+    | SOFT_KW type
     | IN type
     ;
 
@@ -531,10 +531,9 @@ doWhileStmt
     : DO stmt WHILE '(' expr ')'
     ;
 
-/* ============================================================== */
-/* Expressions                                                     */
-/* ============================================================== */
-
+/*===========*\
+| Expressions |
+\*===========*/
 expr
     : expr OROR expr
     | expr ANDAND expr
@@ -555,8 +554,8 @@ expr
     | expr RANGE expr
     | expr RANGE_UNTIL expr
     | expr ELVIS expr
-    | expr IDENTIFIER expr  %prec INFIX_FN
-    | expr SOFT_KW expr     %prec INFIX_FN
+    | expr IDENTIFIER expr %prec INFIX_FN
+    | expr SOFT_KW expr %prec INFIX_FN
     | expr '+' expr
     | expr '-' expr
     | expr '*' expr
@@ -570,9 +569,9 @@ expr
     | expr INCR
     | expr DECR
     | expr DBL_EXCL
-    | expr '.' identifier           { free($3); }
-    | expr SAFE_DOT identifier      { free($3); }
-    | expr COLONCOLON identifier    { free($3); }
+    | expr '.' identifier { free($3); }
+    | expr SAFE_DOT identifier { free($3); }
+    | expr COLONCOLON identifier { free($3); }
     | expr COLONCOLON CLASS
     | expr '(' opt_args ')'
     | expr '(' opt_args ')' lambda
@@ -582,17 +581,17 @@ expr
     ;
 
 primary
-    : INT_LIT                                    { free($1); }
-    | REAL_LIT                                   { free($1); }
-    | STRING_LIT                                 { free($1); }
-    | CHAR_LIT                                   { free($1); }
-    | BOOL_LIT                                   { free($1); }
+    : INT_LIT { free($1); }
+    | REAL_LIT { free($1); }
+    | STRING_LIT { free($1); }
+    | CHAR_LIT { free($1); }
+    | BOOL_LIT { free($1); }
     | NULL_LIT
-    | identifier                                 { free($1); }
+    | identifier { free($1); }
     | THIS
-    | THIS '@' identifier                        { free($3); }
+    | THIS '@' identifier { free($3); }
     | SUPER
-    | SUPER '@' identifier                       { free($3); }
+    | SUPER '@' identifier { free($3); }
     | SUPER '<' type '>'
     | '(' expr ')'
     | lambda
@@ -600,25 +599,24 @@ primary
     | whenExpr
     | tryExpr
     | objectLit
-    | COLONCOLON identifier                      { free($2); }
+    | COLONCOLON identifier { free($2); }
     | COLONCOLON CLASS
-    | jumpExpr                                   /* break/continue/return/throw as expressions */
+    | jumpExpr
     ;
 
   /* jump-expressions usable anywhere an expression is allowed */
 jumpExpr
-    : RETURN                                  %prec UMINUS
-    | RETURN expr                             %prec UMINUS
-    | RETURN '@' identifier                   %prec UMINUS  { free($3); }
-    | RETURN '@' identifier expr              %prec UMINUS  { free($3); }
+    : RETURN %prec UMINUS
+    | RETURN expr %prec UMINUS
+    | RETURN '@' identifier %prec UMINUS { free($3); }
+    | RETURN '@' identifier expr %prec UMINUS { free($3); }
     | BREAK
     | CONTINUE
-    | BREAK '@' identifier                                  { free($3); }
-    | CONTINUE '@' identifier                               { free($3); }
-    | THROW expr                              %prec UMINUS
+    | BREAK '@' identifier { free($3); }
+    | CONTINUE '@' identifier { free($3); }
+    | THROW expr %prec UMINUS
     ;
 
-/* lambdas: either statements only, or "params -> stmts" */
 lambda
     : '{' opt_seps '}'
     | '{' opt_seps stmts opt_seps '}'
@@ -634,14 +632,14 @@ lambdaParamList
     ;
 
 lambdaParam
-    : IDENTIFIER                               { free($1); }
-    | IDENTIFIER ':' type                      { free($1); }
+    : IDENTIFIER { free($1); }
+    | IDENTIFIER ':' type { free($1); }
     | '(' destructList ')'
-    | '_'      /* underscore is just IDENTIFIER, kept here for documentation */
+    | '_'
     ;
 
 ifExpr
-    : IF '(' expr ')' expr                  %prec THEN
+    : IF '(' expr ')' expr %prec THEN
     | IF '(' expr ')' expr ELSE expr
     ;
 
@@ -650,8 +648,8 @@ whenExpr
     | WHEN '{' opt_seps whenEntries opt_seps '}'
     | WHEN '(' expr ')' '{' opt_seps '}'
     | WHEN '(' expr ')' '{' opt_seps whenEntries opt_seps '}'
-    | WHEN '(' VAL identifier '=' expr ')' '{' opt_seps whenEntries opt_seps '}'              { free($4); }
-    | WHEN '(' VAL identifier ':' type '=' expr ')' '{' opt_seps whenEntries opt_seps '}'     { free($4); }
+    | WHEN '(' VAL identifier '=' expr ')' '{' opt_seps whenEntries opt_seps '}' { free($4); }
+    | WHEN '(' VAL identifier ':' type '=' expr ')' '{' opt_seps whenEntries opt_seps '}' { free($4); }
     ;
 
 whenEntries
@@ -689,12 +687,12 @@ catchList
     ;
 
 catchClause
-    : CATCH '(' opt_modifiers identifier ':' type ')' block   { free($4); }
+    : CATCH '(' opt_modifiers identifier ':' type ')' block { free($4); }
     ;
 
 opt_modifiers
     : /* empty */
-    | modifiers opt_seps modifierItem    /* at least one */
+    | modifiers opt_seps modifierItem
     ;
 
 objectLit
@@ -713,7 +711,7 @@ argList
 
 arg
     : expr
-    | identifier '=' expr   { free($1); }
+    | identifier '=' expr { free($1); }
     | '*' expr
     ;
 
@@ -737,7 +735,7 @@ int process_single_file(const char *path) {
     load_source_lines(path);
     
     line_num = 1;  /* reset line number for new file */
-    printf("\n--- File: %s ---\n", path);
+    printf("\nFile: %s\n", path);
     int rc = yyparse();
 
     printf("\n  Declarations: %d | Errors: %d\n", decl_count, error_cnt);
@@ -807,7 +805,7 @@ int main(int argc, char **argv) {
             fputc('\n', stdout);
             process_directory_recursively(path);
             printf("\n========================================\n");
-            printf("Analysis complete.\n");
+            printf("           Analysis complete.           \n");
             printf("========================================\n");
         } else {
             /* File: process as before */
@@ -819,13 +817,13 @@ int main(int argc, char **argv) {
         yyin = stdin;
     }
 
-    printf("\n========================================\n");
+    printf("\n=============================================\n");
     if (error_count == 0) {
         printf("Result: SUCCESS - file is valid Kotlin code.\n");
     } else {
         printf("Result: FAILURE - file contains %d error(s).\n", error_count);
     }
-    printf("========================================\n");
+    printf("=============================================\n");
 
     return (error_count == 0) ? 0 : 1;
 }
