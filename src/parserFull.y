@@ -11,6 +11,8 @@ void yyerror(const char *s);
 int has_error = 0; 
 %}
 
+%define lr.type canonical-lr
+
 %union {
     int int_val;
     char* str_val;

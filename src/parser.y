@@ -1,20 +1,10 @@
-/*
- * Kotlin validator grammar (Bison, LALR(1)).
- *
- * Strategy: parse declarations strictly (package/import/class/object/
- * interface/fun/val/var/typealias), parse statement and expression bodies
- * permissively. Soft keywords (open, final, private, get, set, init, by,
- * ...) all arrive as a single SOFT_KW token, so the grammar doesn't have
- * to enumerate every keyword in every modifier slot.
- *
- * The parser reports lexical errors (from the lexer) and syntax errors
- * (from yyerror), recovers via the standard 'error' token, and continues
- * - per the project spec it must NOT abort on the first error.
- */
+%define lr.type canonical-lr
 %{
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 extern int yylex(void);
 extern int line_num;
@@ -24,6 +14,7 @@ extern char *yytext;
 void yyerror(const char *s);
 
 int error_count = 0;
+int error_cnt = 0;
 
 typedef struct {
     char *kind;
@@ -42,9 +33,6 @@ static void add_decl(const char *kind, const char *name, int line) {
     decl_count++;
 }
 
-/* Source line cache, populated once in main() so yyerror() can echo the
- * offending line back to the user. Keeps errors anchored to real code.
- */
 static char **source_lines  = NULL;
 static int    source_nlines = 0;
 
@@ -102,7 +90,6 @@ void print_source_line(int line) {
 
 %type <str> identifier qualifiedName
 
-  /* operator precedence, lowest first - matches Kotlin's grammar reference */
 %right '=' PLUS_EQ MINUS_EQ STAR_EQ SLASH_EQ MOD_EQ
 %right ARROW
 %left  OROR
@@ -111,7 +98,7 @@ void print_source_line(int line) {
 %left  '<' '>' LEQ GEQ
 %nonassoc IN NOT_IN IS NOT_IS
 %right ELVIS
-%left  INFIX_FN                              /* infix function call: a foo b */
+%left INFIX_FN
 %nonassoc RANGE RANGE_UNTIL
 %left  '+' '-'
 %left  '*' '/' '%'
@@ -129,9 +116,9 @@ void print_source_line(int line) {
 
 %%
 
-/* ============================================================== */
-/* File top level                                                  */
-/* ============================================================== */
+/*==============*\
+| File top level |
+\*==============*/
 
 file
     : opt_seps
@@ -160,9 +147,9 @@ topItem
     | declaration
     ;
 
-/* ============================================================== */
-/* Package / import                                                */
-/* ============================================================== */
+/*================*\
+| Package / import |
+\*================*/
 
 packageDecl
     : PACKAGE qualifiedName
@@ -202,9 +189,9 @@ identifier
     | SET            { $$ = strdup("set"); }
     ;
 
-/* ============================================================== */
-/* Declarations                                                    */
-/* ============================================================== */
+/*============*\
+| Declarations |
+\*============*/
 
 declaration
     : classDecl
@@ -233,16 +220,16 @@ annotation
     ;
 
 classDecl
-    : modifiers CLASS IDENTIFIER opt_typeParams opt_primCtor opt_supertypes opt_whereClause opt_classBody
-        { printf("[Line %d] Class:     %s\n", line_num, $3); add_decl("class", $3, line_num); free($3); }
-    | modifiers INTERFACE IDENTIFIER opt_typeParams opt_supertypes opt_whereClause opt_classBody
-        { printf("[Line %d] Interface: %s\n", line_num, $3); add_decl("interface", $3, line_num); free($3); }
+    : modifiers opt_seps CLASS IDENTIFIER opt_typeParams opt_primCtor opt_supertypes opt_whereClause opt_classBody
+        { printf("[Line %d] Class:     %s\n", line_num, $4); add_decl("class", $4, line_num); free($4); }
+    | modifiers opt_seps INTERFACE IDENTIFIER opt_typeParams opt_supertypes opt_whereClause opt_classBody
+        { printf("[Line %d] Interface: %s\n", line_num, $4); add_decl("interface", $4, line_num); free($4); }
     ;
 
 objectDecl
-    : modifiers OBJECT IDENTIFIER opt_supertypes opt_classBody
-        { printf("[Line %d] Object:    %s\n", line_num, $3); add_decl("object", $3, line_num); free($3); }
-    | modifiers OBJECT opt_supertypes opt_classBody     /* unnamed (e.g. companion object) */
+    : modifiers opt_seps OBJECT IDENTIFIER opt_supertypes opt_classBody
+        { printf("[Line %d] Object:    %s\n", line_num, $4); add_decl("object", $4, line_num); free($4); }
+    | modifiers opt_seps OBJECT opt_supertypes opt_classBody     /* unnamed (e.g. companion object) */
         { printf("[Line %d] Object:    <anonymous>\n", line_num); add_decl("object", "<anon>", line_num); }
     ;
 
@@ -257,16 +244,16 @@ typeParamList
     ;
 
 typeParam
-    : modifiers identifier            { free($2); }
-    | modifiers identifier ':' type   { free($2); }
+    : modifiers opt_seps identifier            { free($3); }
+    | modifiers opt_seps identifier ':' type   { free($3); }
     ;
 
 opt_primCtor
     : /* empty */
     | '(' ')'
     | '(' ctorParamList opt_comma ')'
-    | modifiers CONSTRUCTOR '(' ')'
-    | modifiers CONSTRUCTOR '(' ctorParamList opt_comma ')'
+    | modifiers opt_seps CONSTRUCTOR '(' ')'
+    | modifiers opt_seps CONSTRUCTOR '(' ctorParamList opt_comma ')'
     ;
 
 opt_comma : /* empty */ | ',' ;
@@ -277,12 +264,12 @@ ctorParamList
     ;
 
 ctorParam
-    : modifiers identifier ':' type                    { free($2); }
-    | modifiers identifier ':' type '=' expr           { free($2); }
-    | modifiers VAL identifier ':' type                { free($3); }
-    | modifiers VAR identifier ':' type                { free($3); }
-    | modifiers VAL identifier ':' type '=' expr       { free($3); }
-    | modifiers VAR identifier ':' type '=' expr       { free($3); }
+    : modifiers opt_seps identifier ':' type                    { free($3); }
+    | modifiers opt_seps identifier ':' type '=' expr           { free($3); }
+    | modifiers opt_seps VAL identifier ':' type                { free($4); }
+    | modifiers opt_seps VAR identifier ':' type                { free($4); }
+    | modifiers opt_seps VAL identifier ':' type '=' expr       { free($4); }
+    | modifiers opt_seps VAR identifier ':' type '=' expr       { free($4); }
     ;
 
 opt_supertypes
@@ -319,10 +306,6 @@ members
           fprintf(stderr, "         (recovered in class body around line %d)\n", line_num); }
     ;
 
-  /* Accessor IS a member - now that get/set are dedicated GET/SET tokens
-   * (not SOFT_KW), accessor-as-member doesn't conflict with modifier-
-   * extending-with-SOFT_KW.
-   */
 member
     : declaration
     | initBlock
@@ -336,7 +319,7 @@ initBlock
     ;
 
 secondaryCtor
-    : modifiers CONSTRUCTOR '(' opt_ctorParams ')' opt_ctorDelegation opt_funBody  /* CONSTRUCTOR is hard kw */
+    : modifiers opt_seps CONSTRUCTOR '(' opt_ctorParams ')' opt_ctorDelegation opt_funBody  /* CONSTRUCTOR is hard kw */
     ;
 opt_ctorParams
     : /* empty */
@@ -353,25 +336,18 @@ enumEntries
     | enumEntries ',' opt_seps enumEntry          /* allow newline after comma */
     ;
 
-  /* enum entries: only IDENTIFIER (not soft keywords) - so SOFT_KW
-   * doesn't reduce to identifier here and conflict with accessor/initBlock.
-   */
 enumEntry
-    : modifiers IDENTIFIER                              { free($2); }
-    | modifiers IDENTIFIER '(' opt_args ')'             { free($2); }
-    | modifiers IDENTIFIER '(' opt_args ')' classBody   { free($2); }
-    | modifiers IDENTIFIER classBody                    { free($2); }
+    : modifiers opt_seps IDENTIFIER                              { free($3); }
+    | modifiers opt_seps IDENTIFIER '(' opt_args ')'             { free($3); }
+    | modifiers opt_seps IDENTIFIER '(' opt_args ')' classBody   { free($3); }
+    | modifiers opt_seps IDENTIFIER classBody                    { free($3); }
     ;
 
 funDecl
-    : modifiers FUN opt_typeParams funHead '(' opt_paramList opt_comma ')' opt_retType opt_whereClause opt_funBody
+    : modifiers opt_seps FUN opt_typeParams funHead '(' opt_paramList opt_comma ')' opt_retType opt_whereClause opt_funBody
         { printf("[Line %d] Function declared\n", line_num); add_decl("fun", "<fn>", line_num); }
     ;
 
-  /* funHead absorbs both 'name' and 'receiverType.name' and 'A<T>.name'.
-   * The last identifier is the function name; the rest (if any) is the
-   * receiver type. We don't separate them for validation purposes.
-   */
 funHead
     : identifier                                          { free($1); }
     | funHead '.' identifier                              { free($3); }
@@ -390,8 +366,8 @@ paramList
     ;
 
 param
-    : modifiers identifier ':' type                  { free($2); }
-    | modifiers identifier ':' type '=' expr         { free($2); }
+    : modifiers opt_seps identifier ':' type                  { free($3); }
+    | modifiers opt_seps identifier ':' type '=' expr         { free($3); }
     ;
 
 opt_retType
@@ -420,9 +396,9 @@ opt_funBody
     ;
 
 propDecl
-    : modifiers VAL declTarget opt_init opt_accessors
+    : modifiers opt_seps VAL declTarget opt_init opt_accessors
         { printf("[Line %d] Val\n", line_num); add_decl("val", "<val>", line_num); }
-    | modifiers VAR declTarget opt_init opt_accessors
+    | modifiers opt_seps VAR declTarget opt_init opt_accessors
         { printf("[Line %d] Var\n", line_num); add_decl("var", "<var>", line_num); }
     ;
 
@@ -443,7 +419,7 @@ destructList
 opt_init
     : /* empty */
     | '=' expr
-    | BY expr          /* "by delegate" - BY is a hard keyword now */
+    | BY expr
     ;
 
 opt_accessors
@@ -452,7 +428,6 @@ opt_accessors
     | accessor accessor
     ;
 
-  /* accessor: get/set declaration. GET/SET are dedicated hard keywords. */
 accessor
     : GET '(' ')' opt_retType opt_funBody
     | SET '(' identifier ')' opt_funBody                { free($3); }
@@ -462,20 +437,13 @@ accessor
     ;
 
 typeAliasDecl
-    : modifiers TYPEALIAS identifier opt_typeParams '=' type
-        { printf("[Line %d] Typealias: %s\n", line_num, $3); add_decl("typealias", $3, line_num); free($3); }
+    : modifiers opt_seps TYPEALIAS identifier opt_typeParams '=' type
+        { printf("[Line %d] Typealias: %s\n", line_num, $4); add_decl("typealias", $4, line_num); free($4); }
     ;
 
-/* ============================================================== */
-/* Types                                                           */
-/* ============================================================== */
-
-  /* Note: standalone parenthesized type `(T)` is intentionally not a rule
-   * because it overlaps with the function-type prefix `(T1, T2) -> R` and
-   * LALR can't disambiguate until it sees ARROW (or its absence). The
-   * shift-reduce here defaults to shift, so function types win.
-   * In Kotlin the parenthesized form is rare and can usually be omitted.
-   */
+/*========*\
+|   Types  |
+\*========*/
 type
     : typeRef
     | typeRef '?'
@@ -484,10 +452,10 @@ type
     ;
 
 typeRef
-    : qualifiedName                          { free($1); }
-    | qualifiedName '<' typeArgList opt_comma '>'   { free($1); }
-    | typeRef '.' identifier                 { free($3); }
-    | typeRef '.' identifier '<' typeArgList opt_comma '>'  { free($3); }
+    : qualifiedName { free($1); }
+    | qualifiedName '<' typeArgList opt_comma '>' { free($1); }
+    | typeRef '.' identifier { free($3); }
+    | typeRef '.' identifier '<' typeArgList opt_comma '>' { free($3); }
     ;
 
 opt_typeArgList
@@ -507,9 +475,9 @@ typeArgItem
     | IN type
     ;
 
-/* ============================================================== */
-/* Block / statements                                              */
-/* ============================================================== */
+/*==================*\
+| Block / statements |
+\*==================*/
 
 block
     : '{' opt_seps '}'
@@ -520,14 +488,10 @@ stmts
     : stmt
     | stmts seps stmt
     | stmts error sep
-        { yyerrok;   /* error already counted by yyerror; this is just recovery */
+        { yyerrok;
           fprintf(stderr, "         (recovered in block around line %d)\n", line_num); }
     ;
 
-  /* stmt level: declarations, control flow, assignments, and expressions.
-   * RETURN/BREAK/CONTINUE/THROW were moved to primary so they're usable
-   * inside expressions like `if (x) continue` and `if (x) return v`.
-   */
 stmt
     : declaration
     | expr
@@ -544,7 +508,7 @@ stmt
     ;
 
 labelStmt
-    : IDENTIFIER '@' stmt        { free($1); }
+    : IDENTIFIER '@' stmt { free($1); }
     ;
 
 forStmt
@@ -553,8 +517,8 @@ forStmt
     ;
 
 forVar
-    : modifiers identifier                  { free($2); }
-    | modifiers identifier ':' type         { free($2); }
+    : modifiers opt_seps identifier { free($3); }
+    | modifiers opt_seps identifier ':' type { free($3); }
     | '(' destructList ')'
     ;
 
@@ -591,8 +555,8 @@ expr
     | expr RANGE expr
     | expr RANGE_UNTIL expr
     | expr ELVIS expr
-    | expr IDENTIFIER expr  %prec INFIX_FN              /* infix function call */
-    | expr SOFT_KW expr     %prec INFIX_FN              /* infix using soft keyword name */
+    | expr IDENTIFIER expr  %prec INFIX_FN
+    | expr SOFT_KW expr     %prec INFIX_FN
     | expr '+' expr
     | expr '-' expr
     | expr '*' expr
@@ -606,9 +570,9 @@ expr
     | expr INCR
     | expr DECR
     | expr DBL_EXCL
-    | expr '.' identifier                           { free($3); }
-    | expr SAFE_DOT identifier                      { free($3); }
-    | expr COLONCOLON identifier                    { free($3); }
+    | expr '.' identifier           { free($3); }
+    | expr SAFE_DOT identifier      { free($3); }
+    | expr COLONCOLON identifier    { free($3); }
     | expr COLONCOLON CLASS
     | expr '(' opt_args ')'
     | expr '(' opt_args ')' lambda
@@ -730,7 +694,7 @@ catchClause
 
 opt_modifiers
     : /* empty */
-    | modifiers modifierItem    /* at least one */
+    | modifiers opt_seps modifierItem    /* at least one */
     ;
 
 objectLit
@@ -739,7 +703,7 @@ objectLit
 
 opt_args
     : /* empty */
-    | argList opt_comma
+    | argList opt_seps
     ;
 
 argList
@@ -756,11 +720,71 @@ arg
 %%
 
 void yyerror(const char *s) {
-    error_count++;
+    error_cnt++;
     fprintf(stderr, "[Error #%d] line %d: %s (near '%s')\n",
-            error_count, line_num, s, yytext ? yytext : "?");
+            error_cnt, line_num, s, yytext ? yytext : "?");
     print_source_line(line_num);
     fflush(stderr);
+}
+
+int process_single_file(const char *path) {
+    yyin = fopen(path, "r");
+    error_cnt = 0;
+    if (!yyin) {
+        perror(path);
+        return -1;
+    }
+    load_source_lines(path);
+    
+    line_num = 1;  /* reset line number for new file */
+    printf("\n--- File: %s ---\n", path);
+    int rc = yyparse();
+
+    printf("\n  Declarations: %d | Errors: %d\n", decl_count, error_cnt);
+    if (decl_count > 0) {
+        for (int i = 0; i < decl_count; i++) {
+            printf("    line %4d  %-10s  %s\n",
+                   decls[i].line, decls[i].kind, decls[i].name);
+        }
+    }
+
+    fclose(yyin);
+    decl_count = 0;
+    return error_cnt;
+}
+
+static void process_directory_recursively(const char *dir_path) {
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        perror(dir_path);
+        return;
+    }
+
+    struct dirent *entry;
+    struct stat st;
+    char full_path[4096];
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
+        if (stat(full_path, &st) == -1) {
+            perror(full_path);
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            process_directory_recursively(full_path);
+        } else if (S_ISREG(st.st_mode)) {
+            const char *dot = strrchr(entry->d_name, '.');
+            if (dot && strcmp(dot, ".kt") == 0) {
+                error_cnt += process_single_file(full_path);
+            }
+        }
+    }
+
+    closedir(dir);
 }
 
 static const char *banner =
@@ -770,43 +794,38 @@ static const char *banner =
 
 int main(int argc, char **argv) {
     const char *path = NULL;
+    struct stat st;
+    
     if (argc > 1) {
         path = argv[1];
-        yyin = fopen(path, "r");
-        if (!yyin) { perror(path); return 2; }
-        /* second open is for the source-line cache (yyin is consumed by the lexer) */
-        load_source_lines(path);
+        
+        /* Check if path is a directory or a file */
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            /* Directory: process recursively */
+            fputs(banner, stdout);
+            printf("Source directory: %s\n", path);
+            fputc('\n', stdout);
+            process_directory_recursively(path);
+            printf("\n========================================\n");
+            printf("Analysis complete.\n");
+            printf("========================================\n");
+        } else {
+            /* File: process as before */
+            yyin = fopen(path, "r");
+            if (!yyin) { perror(path); return 2; }
+            load_source_lines(path);
+        }
     } else {
         yyin = stdin;
     }
 
-    fputs(banner, stdout);
-    if (path) printf("Source: %s\n", path);
-    fputc('\n', stdout);
-
-    int rc = yyparse();
-
     printf("\n========================================\n");
-    printf("Analysis Report\n");
-    printf("========================================\n");
-    printf("Declarations found: %d\n", decl_count);
-    printf("Errors reported:    %d\n", error_count);
-
-    if (decl_count > 0) {
-        printf("\nDeclarations:\n");
-        for (int i = 0; i < decl_count; i++) {
-            printf("  line %4d  %-10s  %s\n",
-                   decls[i].line, decls[i].kind, decls[i].name);
-        }
-    }
-
-    printf("\n========================================\n");
-    if (rc == 0 && error_count == 0) {
+    if (error_count == 0) {
         printf("Result: SUCCESS - file is valid Kotlin code.\n");
     } else {
         printf("Result: FAILURE - file contains %d error(s).\n", error_count);
     }
     printf("========================================\n");
 
-    return (rc == 0 && error_count == 0) ? 0 : 1;
+    return (error_count == 0) ? 0 : 1;
 }

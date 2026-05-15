@@ -1,15 +1,3 @@
-/*
- * Kotlin lexer (Flex). Returns tokens consumed by src/parser.y.
- *
- * Key trick borrowed from the Go validator in go/lexer.l:
- *   newlines are emitted as the NL token only when the previous token
- *   could legally END a statement (identifier, literal, ')', ']', '}',
- *   '!!', 'return', etc.). After an operator or an opening bracket the
- *   newline is whitespace. This eliminates spurious NL-in-the-middle-of-
- *   an-expression ambiguities that crippled the earlier grammar.
- *
- * Lexical errors are reported but never abort the scan.
- */
 %{
 #include <stdio.h>
 #include <string.h>
@@ -19,15 +7,12 @@
 int line_num = 1;
 int col_num  = 1;
 
-/* shared with the parser: error count and source-line cache (for nice errors) */
 extern int error_count;
 extern void print_source_line(int line);
-
-/* depth tracking suppresses NL-as-separator inside parens/brackets */
 static int paren_depth   = 0;
 static int bracket_depth = 0;
+static int brace_depth   = 0;
 
-/* set by emit_token() to remember whether the previous token can end a stmt */
 static int last_can_end_stmt = 0;
 
 static void track_text(const char *s) {
@@ -87,13 +72,16 @@ IDENT   {LETTER}({LETTER}|{DIGIT})*
 
 %%
 
-  /* whitespace */
 [ \t\r]+        { col_num += yyleng; }
 
-  /* newlines: only become NL tokens when they actually end a statement */
 \n              {
     line_num++; col_num = 1;
     if (last_can_end_stmt && paren_depth == 0 && bracket_depth == 0) {
+        last_can_end_stmt = 0;
+        return NL;
+    }
+    /* Also emit NL if inside a brace block, even if in parens/brackets */
+    if (last_can_end_stmt && brace_depth > 0) {
         last_can_end_stmt = 0;
         return NL;
     }
@@ -158,12 +146,8 @@ IDENT   {LETTER}({LETTER}|{DIGIT})*
 "false"         { track_text(yytext); yylval.str = strdup("false"); return emit(BOOL_LIT); }
 "null"          { track_text(yytext); return emit(NULL_LIT); }
 
-  /* soft keywords: all returned as the single SOFT_KW token so the
-   * grammar doesn't have to enumerate every soft keyword in every slot.
-   */
 "open"|"final"|"abstract"|"override"|"private"|"public"|"protected"|"internal"|"sealed"|"data"|"inline"|"infix"|"operator"|"suspend"|"tailrec"|"external"|"const"|"lateinit"|"companion"|"where"|"out"|"vararg"|"reified"|"crossinline"|"noinline"|"inner"|"annotation"|"value"|"expect"|"actual"|"field"|"property"|"receiver"|"param"|"setparam"|"delegate"|"file"|"dynamic"   { track_text(yytext); yylval.str = strdup(yytext); return emit(SOFT_KW); }
 
-  /* multi-character operators (longest match first) */
 "==="           { col_num += 3; return emit(EQEQEQ); }
 "!=="           { col_num += 3; return emit(NEQEQ); }
 "=="            { col_num += 2; return emit(EQEQ); }
@@ -187,27 +171,24 @@ IDENT   {LETTER}({LETTER}|{DIGIT})*
 "::"            { col_num += 2; return emit(COLONCOLON); }
 "!!"            { col_num += 2; return emit(DBL_EXCL); }
 
-  /* numeric literals */
-{DIGIT}+\.{DIGIT}+([eE][+-]?{DIGIT}+)?[fF]?    { track_text(yytext); yylval.str = strdup(yytext); return emit(REAL_LIT); }
+{DIGIT}+\.{DIGIT}+([eE][+-]?{DIGIT}+)?[fF]?     { track_text(yytext); yylval.str = strdup(yytext); return emit(REAL_LIT); }
+{DIGIT}[fF]                                     { track_text(yytext); yylval.str = strdup(yytext); return emit(REAL_LIT); }
 "0"[xX]{HEX}+([uU]?[lL]?)                       { track_text(yytext); yylval.str = strdup(yytext); return emit(INT_LIT); }
 "0"[bB]{BIN}+([uU]?[lL]?)                       { track_text(yytext); yylval.str = strdup(yytext); return emit(INT_LIT); }
 {DIGIT}+([uU]?[lL]?)                            { track_text(yytext); yylval.str = strdup(yytext); return emit(INT_LIT); }
 
-  /* string and char literals - opaque, $name interpolation ignored */
 \"([^"\\\n]|\\.)*\"                             { track_text(yytext); yylval.str = strdup(yytext); return emit(STRING_LIT); }
 '([^'\\\n]|\\.)+'                               { track_text(yytext); yylval.str = strdup(yytext); return emit(CHAR_LIT); }
 
-  /* identifiers (including backtick-quoted) */
 {IDENT}         { track_text(yytext); yylval.str = strdup(yytext); return emit(IDENTIFIER); }
 `[^`\n]+`       { track_text(yytext); yylval.str = strdup(yytext); return emit(IDENTIFIER); }
 
-  /* single-character punctuation - track bracket depth for NL suppression */
 "("       { col_num++; paren_depth++;   return emit('('); }
 ")"       { col_num++; if (paren_depth)   paren_depth--;   return emit(')'); }
 "["       { col_num++; bracket_depth++; return emit('['); }
 "]"       { col_num++; if (bracket_depth) bracket_depth--; return emit(']'); }
-"{"       { col_num++; return emit('{'); }
-"}"       { col_num++; return emit('}'); }
+"{"       { col_num++; brace_depth++; return emit('{'); }
+"}"       { col_num++; if (brace_depth) brace_depth--; return emit('}'); }
 "+"       { col_num++; return emit('+'); }
 "-"       { col_num++; return emit('-'); }
 "*"       { col_num++; return emit('*'); }
@@ -226,7 +207,6 @@ IDENT   {LETTER}({LETTER}|{DIGIT})*
 ";"       { col_num++; last_can_end_stmt = 0; return ';'; }
 "@"       { col_num++; return emit('@'); }
 
-  /* anything else is a lexical error - reported but not fatal */
 .   { error_count++; fprintf(stderr, "[Error #%d] line %d, col %d: unexpected character '%s' (lexical)\n", error_count, line_num, col_num, yytext); print_source_line(line_num); fflush(stderr); col_num++; }
 
 %%
